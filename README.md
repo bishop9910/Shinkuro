@@ -115,8 +115,7 @@ npm run build
 
 产物位于 `release/<version>/`，例如 `Shinkuro-Windows-<version>-Setup.exe`。
 
-> 后端用 `-static` 静态编译，`libstdc++` / `libgcc` / `winpthread` / `libcrypto` 全部打进 exe，
-> 打包到任意 Windows 机器都能直接启动，不会再出现「缺少 DLL」。
+> 后端用 `-static` 静态编译，`libstdc++` / `libgcc` / `winpthread` / `libcrypto` 全部打进 exe。
 
 ## 🔐 安全设计
 
