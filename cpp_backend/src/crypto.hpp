@@ -1,0 +1,51 @@
+// OpenSSL libcrypto wrappers: secure random, PBKDF2, HKDF, AES-256-GCM.
+#pragma once
+
+#include <cstdint>
+#include <cstdio>
+#include <stdexcept>
+#include <string>
+#include <utility>
+#include <vector>
+
+#include "util.hpp"
+
+namespace shinkuro {
+
+struct CryptoError : std::runtime_error {
+  using std::runtime_error::runtime_error;
+};
+
+// Thrown when AES-GCM authentication fails (wrong key or tampered data).
+struct AuthError : CryptoError {
+  AuthError() : CryptoError("authentication failed") {}
+};
+
+Bytes random_bytes(size_t n);
+void secure_zero(Bytes& b);
+void secure_zero_string(std::string& s);
+
+Bytes pbkdf2_sha256(const std::string& password, const Bytes& salt, uint32_t iterations,
+                   size_t key_len);
+Bytes hkdf_sha256(const Bytes& ikm, const Bytes& salt, const Bytes& info, size_t out_len);
+
+// Single-shot AES-256-GCM (for the small encrypted index blob).
+// Returns {ciphertext, tag}.
+std::pair<Bytes, Bytes> gcm_encrypt(const Bytes& key, const Bytes& nonce, const Bytes& aad,
+                                    const Bytes& plaintext);
+// Throws AuthError on failure.
+Bytes gcm_decrypt(const Bytes& key, const Bytes& nonce, const Bytes& aad, const Bytes& ciphertext,
+                  const Bytes& tag);
+
+// Streaming AES-256-GCM for file contents (1 MiB chunks, no full buffering).
+// gcm_encrypt_stream reads all of `in`, writes ciphertext to `out`, then appends
+// the 16-byte GCM tag to `out`.
+void gcm_encrypt_stream(const Bytes& key, const Bytes& nonce, const Bytes& aad, FILE* in,
+                        FILE* out);
+// gcm_decrypt_stream reads exactly `cipher_len` bytes of ciphertext from `in`,
+// writes plaintext to `out`, then reads the 16-byte tag from `in` and verifies
+// it (throws AuthError on failure).
+void gcm_decrypt_stream(const Bytes& key, const Bytes& nonce, const Bytes& aad, FILE* in,
+                        FILE* out, uint64_t cipher_len);
+
+}  // namespace shinkuro

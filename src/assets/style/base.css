@@ -1,0 +1,28 @@
+@font-face {
+    font-family: Majesti-Banner-MediumItalic;
+    src: url(./fonts/Noto_Mono_for_Powerline.ttf);
+}
+
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+html,
+body,
+#app {
+  height: 100%;
+}
+
+body {
+  font-family: 'Arial', sans-serif;
+  line-height: 1.6;
+  color: #333;
+  overflow-x: hidden; /* 防止动画溢出导致滚动条 */
+  background-color: #f3f4f6;
+}
+
+html.dark body {
+  background-color: #030712;
+}

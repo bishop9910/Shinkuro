@@ -1,0 +1,61 @@
+// @see https://www.electron.build/configuration/configuration
+{
+  "$schema": "https://raw.githubusercontent.com/electron-userland/electron-builder/master/packages/app-builder-lib/scheme.json",
+  "appId": "shinkuro.bishop9910.com",
+  "asar": true,
+  "productName": "Shinkuro",
+  "directories": {
+    "output": "release/${version}"
+  },
+  // 自动更新发布源：electron-builder 只有在配置了 publish 时才会生成 latest.yml
+  "publish": {
+    "provider": "github",
+    "owner": "bishop9910",
+    "repo": "Shinkuro"
+  },
+  "files": [
+    "dist",
+    "dist-electron"
+  ],
+  // 打包前需先运行 npm run build:backend 编译出 vault_backend.exe（及其 libcrypto DLL）
+  "extraResources": [
+    {
+      "from": "cpp_backend/build",
+      "to": "vault_backend",
+      "filter": [
+        "vault_backend.exe",
+        "*.dll"
+      ]
+    }
+  ],
+  "mac": {
+    "target": [
+      "dmg"
+    ],
+    "artifactName": "${productName}-Mac-${version}-Installer.${ext}"
+  },
+  "win": {
+    "icon": "./icon.ico",
+    "target": [
+      {
+        "target": "nsis",
+        "arch": [
+          "x64"
+        ]
+      }
+    ],
+    "artifactName": "${productName}-Windows-${version}-Setup.${ext}"
+  },
+  "nsis": {
+    "oneClick": false,
+    "perMachine": false,
+    "allowToChangeInstallationDirectory": true,
+    "deleteAppDataOnUninstall": false
+  },
+  "linux": {
+    "target": [
+      "AppImage"
+    ],
+    "artifactName": "${productName}-Linux-${version}.${ext}"
+  }
+}
