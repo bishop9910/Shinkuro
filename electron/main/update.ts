@@ -15,7 +15,12 @@ function initAutoUpdate() {
   autoUpdater.setFeedURL({
     provider: 'github',
     owner: 'bishop9910',
-    repo: 'Shinkuro'
+    repo: 'Shinkuro',
+    // GitHub 会对非浏览器 User-Agent 返回 406，这里带上浏览器 UA
+    requestHeaders: {
+      'User-Agent':
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
+    },
   });
 
   autoUpdater.checkForUpdatesAndNotify();
