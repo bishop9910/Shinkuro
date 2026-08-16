@@ -11,15 +11,11 @@
     "dist",
     "dist-electron"
   ],
-  // 打包前需先运行 npm run build:backend 编译出 vault_backend.exe（及其 libcrypto DLL）
+  // 打包前需先运行 npm run build:backend 编译出 vault_backend.exe（-static 静态编译，无 DLL 依赖）
   "extraResources": [
     {
-      "from": "cpp_backend/build",
-      "to": "vault_backend",
-      "filter": [
-        "vault_backend.exe",
-        "*.dll"
-      ]
+      "from": "cpp_backend/build/vault_backend.exe",
+      "to": "vault_backend/vault_backend.exe"
     }
   ],
   "mac": {

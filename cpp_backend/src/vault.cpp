@@ -7,6 +7,10 @@
 #ifdef _WIN32
 #include <fcntl.h>
 #include <io.h>
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
 #endif
 
 namespace shinkuro {
@@ -26,6 +30,40 @@ constexpr size_t FILE_ID_SIZE = 16;
 constexpr size_t VAULT_HEADER_SIZE = 96;  // magic8 + ver4 + iter4 + salt16 + token32 + reserved32
 constexpr size_t CHUNK_BUF = 1024 * 1024;
 constexpr size_t INDEX_MAX = 256 * 1024 * 1024;  // sanity cap on index blob
+
+#ifdef _WIN32
+std::string win32_last_error() {
+  DWORD err = GetLastError();
+  if (err == 0) return "未知错误";
+  char buf[512] = {0};
+  FormatMessageA(FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS, nullptr, err,
+                 MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT), buf, sizeof(buf), nullptr);
+  std::string msg(buf);
+  while (!msg.empty() && (msg.back() == '\r' || msg.back() == '\n' || msg.back() == ' '))
+    msg.pop_back();
+  return "(" + std::to_string(err) + ") " + msg;
+}
+#endif
+
+// 原子替换文件：Windows 上用 MoveFileExW(MOVEFILE_REPLACE_EXISTING)，对 OneDrive /
+// 网盘 / 杀软等更稳；失败时带重试，避免瞬时的文件占用导致替换失败。
+void atomic_replace(const std::filesystem::path& from, const std::filesystem::path& to) {
+#ifdef _WIN32
+  for (int attempt = 0; attempt < 10; attempt++) {
+    if (MoveFileExW(from.c_str(), to.c_str(),
+                    MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+      return;
+    }
+    Sleep(150 * (attempt + 1));
+  }
+  throw VaultError("IO_ERROR", "替换保险柜文件失败: " + win32_last_error());
+#else
+  std::error_code ec;
+  std::filesystem::remove(to, ec);
+  std::filesystem::rename(from, to, ec);
+  if (ec) throw VaultError("IO_ERROR", "替换保险柜文件失败: " + ec.message());
+#endif
+}
 
 // ---- Unicode-safe file opening ----
 FILE* fopen_path(const std::filesystem::path& p, const char* mode) {
@@ -602,13 +640,12 @@ void Vault::compact(const std::vector<size_t>& keep) {
     std::rethrow_exception(err);
   }
 
-  std::error_code ec;
-  std::filesystem::remove(vault_path_, ec);
-  std::filesystem::rename(tmp, vault_path_, ec);
-  if (ec) {
+  try {
+    atomic_replace(tmp, vault_path_);
+  } catch (...) {
     std::error_code ec2;
     std::filesystem::remove(tmp, ec2);
-    throw VaultError("IO_ERROR", "替换保险柜文件失败");
+    throw;
   }
 
   for (size_t i : keep) files_[i].offset = new_offsets[i];

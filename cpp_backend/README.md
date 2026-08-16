@@ -20,13 +20,12 @@ build.bat            REM 发布版 ( -O2 )
 build.bat debug      REM 调试版 ( -O0 -g )
 ```
 
-产出：`cpp_backend/build/vault_backend.exe`（`build.bat` 会自动把 OpenSSL 运行库 DLL
-`libcrypto-3-x64.dll` 一并复制到 `build/` 目录，Electron 启动后端时无需配置 PATH）。
+产出：`cpp_backend/build/vault_backend.exe`。使用 `-static` 静态编译，libstdc++ /
+libgcc / winpthread / libcrypto 全部链接进 exe，**无需任何额外的运行时 DLL**，
+拷贝到任意机器都能直接启动（不会再出现 `0xC0000135 DLL 缺失`）。
 
+- 需要 OpenSSL 的**静态库**（标准 `mingw-w64-*-openssl` 包已包含 `libcrypto.a`）。
 - 若链接报 `std::filesystem` 符号缺失（g++ < 9），在命令行末尾追加 `-lstdc++fs`。
-- 若使用静态编译的 OpenSSL，可能还需追加 `-luser32 -ladvapi32 -lgdi32`。
-- 若运行时提示找不到 `libcrypto-3-x64.dll`，请将 MSYS2 `bin` 目录下的同名 DLL
-  复制到 `vault_backend.exe` 旁边。
 
 ## 文件格式
 

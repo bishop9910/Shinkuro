@@ -68,7 +68,7 @@
 git clone https://github.com/bishop9910/Shinkuro.git
 cd Shinkuro
 
-# 2. 编译 C++ 加密后端（产出 cpp_backend/build/vault_backend.exe + libcrypto DLL）
+# 2. 编译 C++ 加密后端（产出 cpp_backend/build/vault_backend.exe，静态编译无 DLL 依赖）
 npm run build:backend
 
 # 3. 安装依赖

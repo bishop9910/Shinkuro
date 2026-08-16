@@ -4,9 +4,12 @@
 #
 #  Requirements:
 #    - g++ in PATH (MinGW-w64)
-#    - OpenSSL (libcrypto): pacman -S mingw-w64-x86_64-gcc mingw-w64-x86_64-openssl
+#    - OpenSSL (libcrypto) static library:
+#      pacman -S mingw-w64-x86_64-gcc mingw-w64-x86_64-openssl
 #
 #  Usage:  bash build.sh [debug]   (safe to run from any directory)
+#
+#  Notes: built with -static, so the exe has NO runtime DLL dependencies.
 # ============================================================================
 set -e
 
@@ -17,21 +20,11 @@ SRC="src/main.cpp src/vault.cpp src/crypto.cpp"
 OUT="build"
 mkdir -p "$OUT"
 
-FLAGS="-std=c++17 -O2 -Wall -Wextra -Isrc"
+FLAGS="-static -std=c++17 -O2 -Wall -Wextra -Isrc"
 if [ "$1" = "debug" ]; then
-  FLAGS="-std=c++17 -O0 -g -Wall -Wextra -Isrc"
+  FLAGS="-static -std=c++17 -O0 -g -Wall -Wextra -Isrc"
 fi
 
 echo "Compiling vault_backend.exe ..."
 g++ $FLAGS $SRC -o "$OUT/vault_backend.exe" -lcrypto -lws2_32 -lcrypt32
-
-# Bundle the OpenSSL runtime DLL next to the exe (best effort).
-DLL="$(command -v libcrypto-3-x64.dll 2>/dev/null || true)"
-if [ -z "$DLL" ]; then
-  DLL="$(command -v libcrypto-1_1-x64.dll 2>/dev/null || true)"
-fi
-if [ -n "$DLL" ]; then
-  cp -f "$DLL" "$OUT/" 2>/dev/null || true
-fi
-
-echo "Built: $OUT/vault_backend.exe"
+echo "Built: $OUT/vault_backend.exe (static, no extra DLLs needed)"
