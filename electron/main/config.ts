@@ -6,7 +6,6 @@ const ConfigFilePath: string = RootDistPath + "/config.json";
 
 const OriginConfig: Config = {
   theme: "light",
-  autoUpdate: false,
 };
 
 export function checkConfig(): void{

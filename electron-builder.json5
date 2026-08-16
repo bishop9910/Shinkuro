@@ -7,12 +7,6 @@
   "directories": {
     "output": "release/${version}"
   },
-  // 自动更新发布源：electron-builder 只有在配置了 publish 时才会生成 latest.yml
-  "publish": {
-    "provider": "github",
-    "owner": "bishop9910",
-    "repo": "Shinkuro"
-  },
   "files": [
     "dist",
     "dist-electron"

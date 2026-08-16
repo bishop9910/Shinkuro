@@ -7,7 +7,6 @@ import { showNotification } from './notify'
 import { type NotifyOption, type Config } from '../../type'
 import { init } from './init'
 import { getRealImageData } from './image'
-import { installUpdate } from './update'
 import { getConfig, writeConfig } from './config'
 import { checkTheme } from './theme'
 import { registerVaultIpc, lockVault, shutdownBackend } from './vault'
@@ -136,8 +135,6 @@ ipcMain.handle('dialog-selectFile', async (_event, options) => {
   }
   return null;
 });
-
-ipcMain.on("install-update", installUpdate)
 
 app.on('activate', () => {
   const allWindows = BrowserWindow.getAllWindows()

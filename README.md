@@ -1,6 +1,6 @@
 # Shinkuro 保险柜
 
-一个本地加密保险柜软件：文件以 **AES-256-GCM** 加密存储，前端负责交互，底层加解密与压缩全部由 **C++** 完成，主打效率与安全。
+一个本地加密保险柜软件：文件以 **AES-256-GCM** 加密存储，前端负责交互，底层加解密与压缩全部由 **C++17** 完成，主打效率与安全。
 
 ## 特性
 
@@ -9,8 +9,7 @@
 - **双击调用系统程序打开**：双击任意文件，后台解密到系统临时目录后交给系统默认程序打开。
 - **增容 / 缩水**：添加文件会追加加密块使保险柜变大；删除文件会重写容器、紧排剩余数据使其真正变小。
 - **关闭即清除**：锁定、关窗或退出时，密钥 / 索引 / 临时明文全部在内存与磁盘上被清除。
-- **亮暗主题 + 设置**：外观主题、自动更新开关，持久化到 `config.json`。
-- **自动更新**：集成 `electron-updater`，发布新版本后自动下载提示安装。
+- **亮暗主题**：外观主题持久化到 `config.json`。
 
 ## 技术栈
 
@@ -29,7 +28,6 @@
 │ │ ├── vault.ts           保险柜后端进程管理与 JSON-RPC 客户端
 │ │ ├── config.ts          配置读写
 │ │ ├── theme.ts           亮暗主题
-│ │ ├── update.ts          自动更新
 │ │ └── ...                其余主进程脚本
 │ └─┬ preload
 │   └── index.ts           预加载脚本（暴露 window.ipcRenderer）
@@ -37,10 +35,9 @@
 │ ├─┬ components
 │ │ ├── VaultHome.vue      保险柜创建 / 打开页
 │ │ ├── VaultBrowser.vue   保险柜文件浏览页
-│ │ ├── SettingsDialog.vue 设置（主题 / 自动更新）
-│ │ └── UpdateInfo.vue     更新提示弹窗
+│ │ └── SettingsDialog.vue 设置（主题）
 │ ├─┬ scripts
-│ │ ├── ipc/               IPC 封装（vault / config / update ...）
+│ │ ├── ipc/               IPC 封装（vault / config ...）
 │ │ └── theme.ts           渲染层主题切换
 │ ├── App.vue              根组件
 │ └── main.ts              渲染进程入口
@@ -93,28 +90,7 @@ npm run build:backend
 npm run build
 ```
 
-产物位于 `release/<version>/`：
-
-- `Shinkuro-Windows-<version>-Setup.exe` 安装包
-- `latest.yml` + `*.blockmap` 自动更新元数据
-
-### 关于 latest.yml
-
-`latest.yml` 只有在 `electron-builder.json5` 中配置了 `publish` 时才会生成（已配置为 GitHub 源）。发布新版本时，需把 `Setup.exe`、`latest.yml`、`latest.yml.blockmap` 一起上传到对应 tag 的 GitHub Release；或直接运行 `electron-builder --publish always`（需环境变量 `GH_TOKEN`）。
-
-## 自动更新
-
-更新逻辑在 `electron/main/update.ts`，请确认发布源与真实仓库一致：
-
-```ts
-autoUpdater.setFeedURL({
-  provider: 'github',
-  owner: 'bishop9910',
-  repo: 'Shinkuro'
-});
-```
-
-同时保证 `electron-builder.json5` 中的 `publish.owner` / `publish.repo` 与之相同。自动更新仅在打包后的应用里生效（`update.ts` 中已用 `app.isPackaged` 做了判断）。
+产物位于 `release/<version>/`，例如 `Shinkuro-Windows-<version>-Setup.exe`。
 
 ## 安全说明
 
