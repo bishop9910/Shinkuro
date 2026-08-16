@@ -90,6 +90,8 @@ magic(8) | version(4) | pair_token(32) | nonce(12) | cipher_len(8) | ciphertext 
 {"id":1,"method":"list"}
 {"id":1,"method":"add","params":{"src":"C:/file.pdf"}}
 {"id":1,"method":"extract","params":{"name":"file.pdf"}}
+{"id":1,"method":"extract_to","params":{"name":"file.pdf","dest":"D:/out/file.pdf"}}
+{"id":1,"method":"change_password","params":{"old_password":"old","new_password":"new"}}
 {"id":1,"method":"delete","params":{"name":"file.pdf"}}
 {"id":1,"method":"shutdown"}
 ```
@@ -104,6 +106,8 @@ magic(8) | version(4) | pair_token(32) | nonce(12) | cipher_len(8) | ciphertext 
 - 双击「打开文件」会把解密后的临时文件写到系统临时目录下的随机子目录，
   锁定/退出时对该目录逐文件覆写归零并删除。
 - 密码字符串在用完 `derive_keys` 后立即清零。
+- 保险柜打开期间，后端会持有 `.vault` / `.idx` 的文件句柄且不共享删除权限（Windows），
+  从而阻止用户误删正在使用的保险柜文件；锁定/退出后自动释放。
 
 > 注意：若某临时文件正被外部程序（如 PDF 阅读器）占用，Windows 下删除可能失败，
 > 该文件会残留于 `%TEMP%\shinkuro-vault\`，可手动清理。

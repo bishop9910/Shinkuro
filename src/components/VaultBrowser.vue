@@ -2,16 +2,28 @@
 import { computed, onMounted, ref } from 'vue'
 import {
   ElButton,
+  ElDialog,
+  ElForm,
+  ElFormItem,
   ElIcon,
+  ElInput,
   ElMessage,
   ElMessageBox,
   ElTable,
   ElTableColumn,
   ElTooltip,
 } from 'element-plus'
-import { Delete, Document, FolderAdd, Lock } from '@element-plus/icons-vue'
+import { Delete, Document, Download, FolderAdd, Key, Lock } from '@element-plus/icons-vue'
 import type { VaultEntry } from '../../type'
-import { addFiles, deleteFile, listFiles, lockVault, openFile } from '../scripts/ipc/vault'
+import {
+  addFiles,
+  changePassword,
+  deleteFile,
+  extractTo,
+  listFiles,
+  lockVault,
+  openFile,
+} from '../scripts/ipc/vault'
 import SettingsDialog from './SettingsDialog.vue'
 
 const props = defineProps<{ path: string }>()
@@ -78,6 +90,15 @@ function onRowDblClick(row: VaultEntry) {
   onOpen(row.name)
 }
 
+async function onExtract(name: string) {
+  try {
+    const r = await extractTo(name)
+    if (!r.canceled) ElMessage.success(`已提取到：${r.path}`)
+  } catch (e) {
+    ElMessage.error(e instanceof Error ? e.message : '提取失败')
+  }
+}
+
 async function onDelete(name: string) {
   try {
     await ElMessageBox.confirm(
@@ -107,6 +128,40 @@ async function onLock() {
   emit('locked')
 }
 
+const pwdVisible = ref(false)
+const oldPassword = ref('')
+const newPassword = ref('')
+const confirmPassword = ref('')
+const pwdBusy = ref(false)
+
+async function submitChangePassword() {
+  if (!oldPassword.value) {
+    ElMessage.warning('请输入当前密码')
+    return
+  }
+  if (!newPassword.value) {
+    ElMessage.warning('请输入新密码')
+    return
+  }
+  if (newPassword.value !== confirmPassword.value) {
+    ElMessage.warning('两次新密码不一致')
+    return
+  }
+  pwdBusy.value = true
+  try {
+    await changePassword(oldPassword.value, newPassword.value)
+    pwdVisible.value = false
+    ElMessage.success('密码修改成功')
+  } catch (e) {
+    ElMessage.error(e instanceof Error ? e.message : '修改密码失败')
+  } finally {
+    pwdBusy.value = false
+    oldPassword.value = ''
+    newPassword.value = ''
+    confirmPassword.value = ''
+  }
+}
+
 onMounted(load)
 </script>
 
@@ -131,6 +186,7 @@ onMounted(load)
       </div>
       <div class="flex shrink-0 items-center gap-2">
         <el-button type="primary" :icon="FolderAdd" @click="onAdd">添加文件</el-button>
+        <el-button :icon="Key" @click="pwdVisible = true">修改密码</el-button>
         <el-button :icon="Lock" @click="onLock">锁定</el-button>
         <SettingsDialog />
       </div>
@@ -166,9 +222,12 @@ onMounted(load)
         <el-table-column label="修改时间" width="180">
           <template #default="{ row }">{{ formatTime(row.mtime) }}</template>
         </el-table-column>
-        <el-table-column label="操作" width="140" align="right">
+        <el-table-column label="操作" width="200" align="right">
           <template #default="{ row }">
             <el-button link type="primary" size="small" @click="onOpen(row.name)">打开</el-button>
+            <el-button link type="primary" size="small" :icon="Download" @click="onExtract(row.name)">
+              提取
+            </el-button>
             <el-button link type="danger" size="small" :icon="Delete" @click="onDelete(row.name)">
               删除
             </el-button>
@@ -180,5 +239,36 @@ onMounted(load)
     <p class="text-center text-xs text-gray-400 dark:text-gray-500">
       双击文件即可解密并用系统默认程序打开，锁定后临时明文会被彻底清除
     </p>
+
+    <!-- 修改密码对话框 -->
+    <el-dialog v-model="pwdVisible" title="修改密码" width="440px" append-to-body>
+      <el-form label-position="top" @submit.prevent>
+        <el-form-item label="当前密码">
+          <el-input
+            v-model="oldPassword"
+            type="password"
+            show-password
+            placeholder="输入当前密码"
+          />
+        </el-form-item>
+        <el-form-item label="新密码">
+          <el-input v-model="newPassword" type="password" show-password placeholder="输入新密码" />
+        </el-form-item>
+        <el-form-item label="确认新密码">
+          <el-input
+            v-model="confirmPassword"
+            type="password"
+            show-password
+            placeholder="再次输入新密码"
+          />
+        </el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button @click="pwdVisible = false">取消</el-button>
+        <el-button type="primary" :loading="pwdBusy" @click="submitChangePassword">
+          确认修改
+        </el-button>
+      </template>
+    </el-dialog>
   </div>
 </template>

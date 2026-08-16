@@ -48,4 +48,12 @@ void gcm_encrypt_stream(const Bytes& key, const Bytes& nonce, const Bytes& aad, 
 void gcm_decrypt_stream(const Bytes& key, const Bytes& nonce, const Bytes& aad, FILE* in,
                         FILE* out, uint64_t cipher_len);
 
+// Re-encrypt a chunk in-place-pipeline: reads `cipher_len` bytes of ciphertext +
+// 16-byte tag from `in` (encrypted with old_key/old_nonce), decrypts in memory,
+// re-encrypts with new_key/new_nonce, and writes the new ciphertext + new tag to
+// `out`. No plaintext ever touches disk. Throws AuthError if the old tag fails.
+void gcm_reencrypt_stream(const Bytes& old_key, const Bytes& old_nonce, const Bytes& aad,
+                          const Bytes& new_key, const Bytes& new_nonce, FILE* in, FILE* out,
+                          uint64_t cipher_len);
+
 }  // namespace shinkuro

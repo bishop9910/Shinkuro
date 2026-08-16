@@ -52,8 +52,11 @@ public:
 
   Json list() const;
   Json add(const std::filesystem::path& src_path);
-  Json extract(const std::string& name);  // returns {path, name, size}
-  void remove(const std::string& name);   // deletes + compacts (shrinks) the vault
+  Json extract(const std::string& name);  // returns {path, name, size} (to temp dir)
+  Json extract_to(const std::string& name,
+                  const std::filesystem::path& dest);  // returns {path, name, size}
+  void remove(const std::string& name);                // deletes + compacts (shrinks) the vault
+  void change_password(const std::string& old_password, const std::string& new_password);
 
 private:
   bool open_ = false;
@@ -61,16 +64,29 @@ private:
   std::filesystem::path index_path_;
   Bytes master_key_, idx_key_, chunk_key_;
   Bytes pair_token_;
+  Bytes salt_;
+  uint32_t iterations_ = 0;
   std::vector<FileEntry> files_;
   std::filesystem::path temp_dir_;
+
+#ifdef _WIN32
+  void* vault_lock_ = nullptr;  // denies deletion of the vault file while open
+  void* idx_lock_ = nullptr;    // denies deletion of the index file while open
+#endif
 
   void derive_keys(const std::string& password, const Bytes& salt, uint32_t iterations);
   void clear_keys();
   void write_index();
   void load_index();
   void compact(const std::vector<size_t>& keep);
+  void decrypt_to(const FileEntry& e, const std::filesystem::path& out_path);
   std::filesystem::path make_temp_dir();
   void wipe_temp_dir();
+
+  void acquire_locks();
+  void release_locks();
+  void release_vault_lock();
+  void acquire_vault_lock();
 
   FileEntry* find(const std::string& name);
   const FileEntry* find(const std::string& name) const;

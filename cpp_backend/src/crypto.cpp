@@ -236,4 +236,84 @@ void gcm_decrypt_stream(const Bytes& key, const Bytes& nonce, const Bytes& aad, 
   if (final_len > 0) std::fwrite(outbuf.data(), 1, final_len, out);
 }
 
+void gcm_reencrypt_stream(const Bytes& old_key, const Bytes& old_nonce, const Bytes& aad,
+                          const Bytes& new_key, const Bytes& new_nonce, FILE* in, FILE* out,
+                          uint64_t cipher_len) {
+  EVP_CIPHER_CTX* d_ctx = EVP_CIPHER_CTX_new();
+  EVP_CIPHER_CTX* e_ctx = EVP_CIPHER_CTX_new();
+  if (!d_ctx || !e_ctx) {
+    if (d_ctx) EVP_CIPHER_CTX_free(d_ctx);
+    if (e_ctx) EVP_CIPHER_CTX_free(e_ctx);
+    throw CryptoError("EVP_CIPHER_CTX_new failed");
+  }
+  CtxGuard gd(d_ctx);
+  CtxGuard ge(e_ctx);
+
+  // ---- decrypt side (old key) ----
+  if (EVP_DecryptInit_ex(d_ctx, EVP_aes_256_gcm(), nullptr, nullptr, nullptr) != 1)
+    throw CryptoError("EVP_DecryptInit_ex failed");
+  if (EVP_CIPHER_CTX_ctrl(d_ctx, EVP_CTRL_GCM_SET_IVLEN, AES_GCM_IV_LEN, nullptr) != 1)
+    throw CryptoError("set ivlen failed");
+  if (EVP_DecryptInit_ex(d_ctx, nullptr, nullptr, old_key.data(), old_nonce.data()) != 1)
+    throw CryptoError("EVP_DecryptInit_ex(key) failed");
+  int len = 0;
+  if (!aad.empty() &&
+      EVP_DecryptUpdate(d_ctx, nullptr, &len, aad.data(), static_cast<int>(aad.size())) != 1)
+    throw CryptoError("AAD update failed");
+
+  // ---- encrypt side (new key) ----
+  if (EVP_EncryptInit_ex(e_ctx, EVP_aes_256_gcm(), nullptr, nullptr, nullptr) != 1)
+    throw CryptoError("EVP_EncryptInit_ex failed");
+  if (EVP_CIPHER_CTX_ctrl(e_ctx, EVP_CTRL_GCM_SET_IVLEN, AES_GCM_IV_LEN, nullptr) != 1)
+    throw CryptoError("set ivlen failed");
+  if (EVP_EncryptInit_ex(e_ctx, nullptr, nullptr, new_key.data(), new_nonce.data()) != 1)
+    throw CryptoError("EVP_EncryptInit_ex(key) failed");
+  if (!aad.empty() &&
+      EVP_EncryptUpdate(e_ctx, nullptr, &len, aad.data(), static_cast<int>(aad.size())) != 1)
+    throw CryptoError("AAD update failed");
+
+  std::vector<uint8_t> inbuf(CHUNK), plain(CHUNK + 16), outbuf(CHUNK + 16);
+  uint64_t remaining = cipher_len;
+  while (remaining > 0) {
+    size_t want = static_cast<size_t>(remaining < CHUNK ? remaining : CHUNK);
+    size_t n = std::fread(inbuf.data(), 1, want, in);
+    if (n == 0) throw CryptoError("unexpected EOF in ciphertext");
+    int plain_len = 0;
+    if (EVP_DecryptUpdate(d_ctx, plain.data(), &plain_len, inbuf.data(), static_cast<int>(n)) != 1)
+      throw CryptoError("decrypt update failed");
+    int out_len = 0;
+    if (EVP_EncryptUpdate(e_ctx, outbuf.data(), &out_len, plain.data(), plain_len) != 1)
+      throw CryptoError("encrypt update failed");
+    if (out_len > 0) std::fwrite(outbuf.data(), 1, out_len, out);
+    remaining -= n;
+  }
+
+  // verify old tag
+  Bytes old_tag(TAG_SIZE);
+  if (std::fread(old_tag.data(), 1, TAG_SIZE, in) != TAG_SIZE)
+    throw CryptoError("missing GCM tag");
+  if (EVP_CIPHER_CTX_ctrl(d_ctx, EVP_CTRL_GCM_SET_TAG, TAG_SIZE, old_tag.data()) != 1)
+    throw CryptoError("set tag failed");
+  int final_plain = 0;
+  if (EVP_DecryptFinal_ex(d_ctx, plain.data(), &final_plain) != 1) {
+    throw AuthError();
+  }
+  if (final_plain > 0) {
+    int out_len = 0;
+    if (EVP_EncryptUpdate(e_ctx, outbuf.data(), &out_len, plain.data(), final_plain) != 1)
+      throw CryptoError("encrypt update failed");
+    if (out_len > 0) std::fwrite(outbuf.data(), 1, out_len, out);
+  }
+
+  // finalize encrypt + write new tag
+  int final_cipher = 0;
+  if (EVP_EncryptFinal_ex(e_ctx, outbuf.data(), &final_cipher) != 1)
+    throw CryptoError("encrypt final failed");
+  if (final_cipher > 0) std::fwrite(outbuf.data(), 1, final_cipher, out);
+  Bytes new_tag(TAG_SIZE);
+  if (EVP_CIPHER_CTX_ctrl(e_ctx, EVP_CTRL_GCM_GET_TAG, TAG_SIZE, new_tag.data()) != 1)
+    throw CryptoError("get tag failed");
+  std::fwrite(new_tag.data(), 1, new_tag.size(), out);
+}
+
 }  // namespace shinkuro

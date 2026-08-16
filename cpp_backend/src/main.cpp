@@ -87,6 +87,19 @@ static Json call(const std::string& method, const Json& params) {
   if (method == "extract") {
     return g_vault.extract(params["name"].as_string());
   }
+  if (method == "extract_to") {
+    return g_vault.extract_to(params["name"].as_string(), to_path(params["dest"].as_string()));
+  }
+  if (method == "change_password") {
+    std::string old_pw = params["old_password"].as_string();
+    std::string new_pw = params["new_password"].as_string();
+    g_vault.change_password(old_pw, new_pw);
+    secure_zero_string(old_pw);
+    secure_zero_string(new_pw);
+    Json r = Json::Object();
+    r["ok"] = true;
+    return r;
+  }
   if (method == "delete") {
     g_vault.remove(params["name"].as_string());
     Json r = Json::Object();

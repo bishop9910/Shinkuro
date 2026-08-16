@@ -223,6 +223,39 @@ export function registerVaultIpc() {
       return fail(e)
     }
   })
+
+  ipcMain.handle('vault:extractTo', async (_e, name: string) => {
+    try {
+      const r = await dialog.showSaveDialog({
+        title: '提取文件',
+        defaultPath: name,
+      })
+      if (r.canceled || !r.filePath) return ok({ canceled: true })
+      const res = await request<{ path: string; name: string; size: number }>('extract_to', {
+        name,
+        dest: r.filePath,
+      })
+      return ok({ canceled: false, ...res })
+    } catch (e) {
+      return fail(e)
+    }
+  })
+
+  ipcMain.handle(
+    'vault:changePassword',
+    async (_e, arg: { oldPassword: string; newPassword: string }) => {
+      try {
+        return ok(
+          await request('change_password', {
+            old_password: arg.oldPassword,
+            new_password: arg.newPassword,
+          })
+        )
+      } catch (e) {
+        return fail(e)
+      }
+    }
+  )
 }
 
 // Wipe keys + temp files while the app is still alive (called on lock & window close).

@@ -59,3 +59,13 @@ export function openFile(name: string): Promise<OpenFileResult> {
 export function deleteFile(name: string): Promise<{ ok: boolean }> {
   return call('vault:delete', name)
 }
+
+export function extractTo(
+  name: string
+): Promise<{ canceled: boolean; path?: string; name?: string; size?: number }> {
+  return call('vault:extractTo', name)
+}
+
+export function changePassword(oldPassword: string, newPassword: string): Promise<{ ok: boolean }> {
+  return call('vault:changePassword', { oldPassword, newPassword })
+}

@@ -45,8 +45,6 @@ std::string win32_last_error() {
 }
 #endif
 
-// 原子替换文件：Windows 上用 MoveFileExW(MOVEFILE_REPLACE_EXISTING)，对 OneDrive /
-// 网盘 / 杀软等更稳；失败时带重试，避免瞬时的文件占用导致替换失败。
 void atomic_replace(const std::filesystem::path& from, const std::filesystem::path& to) {
 #ifdef _WIN32
   for (int attempt = 0; attempt < 10; attempt++) {
@@ -64,6 +62,19 @@ void atomic_replace(const std::filesystem::path& from, const std::filesystem::pa
   if (ec) throw VaultError("IO_ERROR", "替换保险柜文件失败: " + ec.message());
 #endif
 }
+
+#ifdef _WIN32
+// 打开并持有文件句柄，且不共享删除权限（FILE_SHARE_DELETE），
+// 从而在保险柜打开期间阻止用户删除 .vault / .idx。
+void* acquire_delete_lock(const std::filesystem::path& p) {
+  HANDLE h = CreateFileW(p.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                         nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+  return (h == INVALID_HANDLE_VALUE) ? nullptr : h;
+}
+void release_delete_lock(void* h) {
+  if (h) CloseHandle(h);
+}
+#endif
 
 // ---- Unicode-safe file opening ----
 FILE* fopen_path(const std::filesystem::path& p, const char* mode) {
@@ -194,11 +205,14 @@ void Vault::derive_keys(const std::string& password, const Bytes& salt, uint32_t
 }
 
 void Vault::clear_keys() {
+  release_locks();
   secure_zero(master_key_);
   secure_zero(idx_key_);
   secure_zero(chunk_key_);
   for (auto& e : files_) secure_zero(e.file_id);
   secure_zero(pair_token_);
+  secure_zero(salt_);
+  iterations_ = 0;
   files_.clear();
 }
 
@@ -231,6 +245,36 @@ void Vault::wipe_temp_dir() {
   temp_dir_.clear();
 }
 
+void Vault::acquire_locks() {
+#ifdef _WIN32
+  release_locks();
+  vault_lock_ = acquire_delete_lock(vault_path_);
+  idx_lock_ = acquire_delete_lock(index_path_);
+#endif
+}
+
+void Vault::release_locks() {
+#ifdef _WIN32
+  release_delete_lock(vault_lock_);
+  release_delete_lock(idx_lock_);
+  vault_lock_ = nullptr;
+  idx_lock_ = nullptr;
+#endif
+}
+
+void Vault::release_vault_lock() {
+#ifdef _WIN32
+  release_delete_lock(vault_lock_);
+  vault_lock_ = nullptr;
+#endif
+}
+
+void Vault::acquire_vault_lock() {
+#ifdef _WIN32
+  vault_lock_ = acquire_delete_lock(vault_path_);
+#endif
+}
+
 // ---------------------------------------------------------------------------
 
 void Vault::create(const std::filesystem::path& vault_path, const std::string& password) {
@@ -252,6 +296,8 @@ void Vault::create(const std::filesystem::path& vault_path, const std::string& p
   }
 
   Bytes salt = random_bytes(SALT_SIZE);
+  salt_ = salt;
+  iterations_ = KDF_ITERATIONS;
   pair_token_ = random_bytes(PAIR_TOKEN_SIZE);
   derive_keys(password, salt, KDF_ITERATIONS);
 
@@ -286,6 +332,7 @@ void Vault::create(const std::filesystem::path& vault_path, const std::string& p
     throw;
   }
   temp_dir_ = make_temp_dir();
+  acquire_locks();
 }
 
 void Vault::open(const std::filesystem::path& vault_path, const std::string& password) {
@@ -313,6 +360,8 @@ void Vault::open(const std::filesystem::path& vault_path, const std::string& pas
     if (version != VAULT_VERSION) throw VaultError("CORRUPT", "不支持的保险柜版本");
     iterations = read_u32(f);
     read_bytes(f, salt.data(), salt.size());
+    salt_ = salt;
+    iterations_ = iterations;
     pair_token_.resize(PAIR_TOKEN_SIZE);
     read_bytes(f, pair_token_.data(), pair_token_.size());
     Bytes reserved(32);
@@ -342,6 +391,7 @@ void Vault::open(const std::filesystem::path& vault_path, const std::string& pas
 
   open_ = true;
   temp_dir_ = make_temp_dir();
+  acquire_locks();
 }
 
 // ---------------------------------------------------------------------------
@@ -484,6 +534,16 @@ Json Vault::add(const std::filesystem::path& src_path) {
   if (!std::filesystem::is_regular_file(src_path, ec))
     throw VaultError("INVALID", "只能添加普通文件");
 
+  // 拒绝把保险柜自身或其索引加进去（避免自引用破坏）
+  {
+    std::error_code c1, c2, c3;
+    auto canon_src = std::filesystem::weakly_canonical(src_path, c1);
+    auto canon_vault = std::filesystem::weakly_canonical(vault_path_, c2);
+    auto canon_idx = std::filesystem::weakly_canonical(index_path_, c3);
+    if (!c1 && !c2 && !c3 && (canon_src == canon_vault || canon_src == canon_idx))
+      throw VaultError("INVALID", "不能把保险柜文件本身添加进去");
+  }
+
   std::string name = src_path.filename().u8string();
   if (find(name)) throw VaultError("EXISTS", "已存在同名文件: " + name);
 
@@ -539,14 +599,7 @@ Json Vault::add(const std::filesystem::path& src_path) {
   return o;
 }
 
-Json Vault::extract(const std::string& name) {
-  if (!open_) throw VaultError("NOT_OPEN", "保险柜未打开");
-  const FileEntry* e = find(name);
-  if (!e) throw VaultError("NOT_FOUND", "文件不存在: " + name);
-
-  std::string base = basename_utf8(name);
-  std::filesystem::path out_path = temp_dir_ / std::filesystem::u8path(base);
-
+void Vault::decrypt_to(const FileEntry& e, const std::filesystem::path& out_path) {
   FILE* vf = fopen_path(vault_path_, "rb");
   if (!vf) throw VaultError("IO_ERROR", "无法打开保险柜文件");
 
@@ -554,15 +607,15 @@ Json Vault::extract(const std::string& name) {
   uint64_t data_len = 0;
   FILE* out = nullptr;
   try {
-    if (file_seek(vf, e->offset) != 0) throw VaultError("IO_ERROR", "定位数据失败");
+    if (file_seek(vf, e.offset) != 0) throw VaultError("IO_ERROR", "定位数据失败");
     read_bytes(vf, nonce.data(), nonce.size());
     data_len = read_u64(vf);
-    if (data_len != e->size) throw VaultError("CORRUPT", "数据长度不一致");
+    if (data_len != e.size) throw VaultError("CORRUPT", "数据长度不一致");
     out = fopen_path(out_path, "wb");
-    if (!out) throw VaultError("IO_ERROR", "无法写入临时文件");
+    if (!out) throw VaultError("IO_ERROR", "无法写入文件");
 
-    Bytes aad = e->file_id;
-    append_u64(aad, e->size);
+    Bytes aad = e.file_id;
+    append_u64(aad, e.size);
     try {
       gcm_decrypt_stream(chunk_key_, nonce, aad, vf, out, data_len);
     } catch (const AuthError&) {
@@ -577,10 +630,34 @@ Json Vault::extract(const std::string& name) {
   }
   std::fclose(out);
   std::fclose(vf);
+}
+
+Json Vault::extract(const std::string& name) {
+  if (!open_) throw VaultError("NOT_OPEN", "保险柜未打开");
+  const FileEntry* e = find(name);
+  if (!e) throw VaultError("NOT_FOUND", "文件不存在: " + name);
+
+  std::string base = basename_utf8(name);
+  std::filesystem::path out_path = temp_dir_ / std::filesystem::u8path(base);
+  decrypt_to(*e, out_path);
 
   Json o = Json::Object();
   o["path"] = out_path.u8string();
   o["name"] = base;
+  o["size"] = static_cast<int64_t>(e->size);
+  return o;
+}
+
+Json Vault::extract_to(const std::string& name, const std::filesystem::path& dest) {
+  if (!open_) throw VaultError("NOT_OPEN", "保险柜未打开");
+  const FileEntry* e = find(name);
+  if (!e) throw VaultError("NOT_FOUND", "文件不存在: " + name);
+
+  decrypt_to(*e, dest);
+
+  Json o = Json::Object();
+  o["path"] = dest.u8string();
+  o["name"] = e->name;
   o["size"] = static_cast<int64_t>(e->size);
   return o;
 }
@@ -640,15 +717,116 @@ void Vault::compact(const std::vector<size_t>& keep) {
     std::rethrow_exception(err);
   }
 
+  release_vault_lock();
   try {
     atomic_replace(tmp, vault_path_);
   } catch (...) {
+    acquire_vault_lock();
     std::error_code ec2;
     std::filesystem::remove(tmp, ec2);
     throw;
   }
+  acquire_vault_lock();
 
   for (size_t i : keep) files_[i].offset = new_offsets[i];
+}
+
+void Vault::change_password(const std::string& old_password, const std::string& new_password) {
+  if (!open_) throw VaultError("NOT_OPEN", "保险柜未打开");
+  if (new_password.empty()) throw VaultError("INVALID", "新密码不能为空");
+
+  // 校验当前密码（常数时间比较）
+  Bytes old_master = pbkdf2_sha256(old_password, salt_, iterations_, KEY_SIZE);
+  bool ok = constant_time_eq(old_master, master_key_);
+  secure_zero(old_master);
+  if (!ok) throw VaultError("WRONG_PASSWORD", "当前密码错误");
+
+  // 派生新密钥（沿用 salt / iterations / pair_token，只换密码）
+  Bytes new_master = pbkdf2_sha256(new_password, salt_, iterations_, KEY_SIZE);
+  Bytes salt_idx = {'S', 'K', 'i', 'd', 'x', 'v', '1'};
+  Bytes salt_chk = {'S', 'K', 'c', 'h', 'n', 'k', 'v', '1'};
+  Bytes new_idx_key = hkdf_sha256(new_master, salt_idx, pair_token_, KEY_SIZE);
+  Bytes new_chunk_key = hkdf_sha256(new_master, salt_chk, pair_token_, KEY_SIZE);
+
+  // 重写保险柜：每块旧密钥解密 → 新密钥加密（GCM 等长，偏移不变）
+  std::filesystem::path tmp = vault_path_;
+  tmp += ".tmp" + random_hex(8);
+
+  FILE* oldf = fopen_path(vault_path_, "rb");
+  if (!oldf) {
+    secure_zero(new_master);
+    secure_zero(new_idx_key);
+    secure_zero(new_chunk_key);
+    throw VaultError("IO_ERROR", "无法打开保险柜文件");
+  }
+  FILE* newf = fopen_path(tmp, "wb");
+  if (!newf) {
+    std::fclose(oldf);
+    secure_zero(new_master);
+    secure_zero(new_idx_key);
+    secure_zero(new_chunk_key);
+    throw VaultError("IO_ERROR", "无法创建临时文件");
+  }
+
+  std::exception_ptr err;
+  try {
+    copy_bytes(oldf, newf, VAULT_HEADER_SIZE);  // header verbatim（salt/iterations 不变）
+    for (const auto& e : files_) {
+      if (file_seek(oldf, e.offset) != 0) throw VaultError("IO_ERROR", "定位数据失败");
+      Bytes nonce(NONCE_SIZE);
+      read_bytes(oldf, nonce.data(), nonce.size());
+      uint64_t data_len = read_u64(oldf);
+      if (data_len != e.size) throw VaultError("CORRUPT", "数据长度不一致");
+      Bytes aad = e.file_id;
+      append_u64(aad, e.size);
+      Bytes new_nonce = random_bytes(NONCE_SIZE);
+      write_bytes(newf, new_nonce.data(), new_nonce.size());
+      write_u64(newf, data_len);
+      try {
+        gcm_reencrypt_stream(chunk_key_, nonce, aad, new_chunk_key, new_nonce, oldf, newf,
+                             data_len);
+      } catch (const AuthError&) {
+        throw VaultError("CORRUPT", "数据校验失败，保险柜可能被篡改");
+      }
+    }
+  } catch (...) {
+    err = std::current_exception();
+  }
+  std::fclose(newf);
+  std::fclose(oldf);
+
+  if (err) {
+    std::error_code ec;
+    std::filesystem::remove(tmp, ec);
+    secure_zero(new_master);
+    secure_zero(new_idx_key);
+    secure_zero(new_chunk_key);
+    std::rethrow_exception(err);
+  }
+
+  release_vault_lock();
+  try {
+    atomic_replace(tmp, vault_path_);
+  } catch (...) {
+    acquire_vault_lock();
+    std::error_code ec;
+    std::filesystem::remove(tmp, ec);
+    secure_zero(new_master);
+    secure_zero(new_idx_key);
+    secure_zero(new_chunk_key);
+    throw;
+  }
+  acquire_vault_lock();
+
+  // 换密钥
+  secure_zero(master_key_);
+  master_key_ = std::move(new_master);
+  secure_zero(idx_key_);
+  idx_key_ = std::move(new_idx_key);
+  secure_zero(chunk_key_);
+  chunk_key_ = std::move(new_chunk_key);
+
+  write_index();
 }
 
 }  // namespace shinkuro
