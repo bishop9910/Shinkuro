@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import {
   ElButton,
   ElDialog,
@@ -9,15 +9,17 @@ import {
   ElInput,
   ElMessage,
   ElMessageBox,
+  ElProgress,
   ElTable,
   ElTableColumn,
   ElTooltip,
 } from 'element-plus'
-import { Delete, Document, Download, FolderAdd, Key, Lock } from '@element-plus/icons-vue'
+import { Delete, Document, Download, FolderAdd, Key, Lock, Refresh } from '@element-plus/icons-vue'
 import type { VaultEntry } from '../../type'
 import {
   addFiles,
   changePassword,
+  compactVault,
   deleteFile,
   extractTo,
   listFiles,
@@ -30,6 +32,26 @@ const props = defineProps<{ path: string }>()
 const emit = defineEmits<{ locked: [] }>()
 
 const files = ref<VaultEntry[]>([])
+const freeBytes = ref(0)
+
+type ProgressInfo = { id: number; phase: string; done: number; total: number }
+const progress = ref<ProgressInfo | null>(null)
+const progressPercent = computed(() => {
+  const p = progress.value
+  if (!p || p.total <= 0) return 0
+  return Math.min(100, Math.round((p.done / p.total) * 100))
+})
+const progressLabel = computed(() => {
+  const p = progress.value
+  if (!p) return ''
+  const labels: Record<string, string> = {
+    encrypt: '正在加密',
+    compact: '正在整理保险柜',
+    reencrypt: '正在重新加密',
+  }
+  const label = labels[p.phase] ?? '处理中'
+  return `${label}（${formatSize(p.done)} / ${formatSize(p.total)}）`
+})
 
 const vaultName = computed(() => {
   const p = props.path.replace(/\\/g, '/')
@@ -59,6 +81,7 @@ async function load() {
   try {
     const list = await listFiles()
     files.value = list.files
+    freeBytes.value = list.free_bytes ?? 0
   } catch (e) {
     ElMessage.error(e instanceof Error ? e.message : '读取文件列表失败')
   }
@@ -72,6 +95,8 @@ async function onAdd() {
     if (r.added.length || r.errors.length) await load()
   } catch (e) {
     ElMessage.error(e instanceof Error ? e.message : '添加失败')
+  } finally {
+    progress.value = null
   }
 }
 
@@ -118,6 +143,18 @@ async function onDelete(name: string) {
   }
 }
 
+async function onCompact() {
+  try {
+    const r = await compactVault()
+    ElMessage.success(`整理完成，释放 ${formatSize(r.freed)}`)
+    await load()
+  } catch (e) {
+    ElMessage.error(e instanceof Error ? e.message : '整理失败')
+  } finally {
+    progress.value = null
+  }
+}
+
 async function onLock() {
   try {
     await lockVault()
@@ -159,10 +196,22 @@ async function submitChangePassword() {
     oldPassword.value = ''
     newPassword.value = ''
     confirmPassword.value = ''
+    progress.value = null
   }
 }
 
-onMounted(load)
+function onVaultProgress(_event: unknown, p: ProgressInfo) {
+  progress.value = p
+}
+
+onMounted(() => {
+  window.ipcRenderer.on('vault:progress', onVaultProgress)
+  load()
+})
+
+onBeforeUnmount(() => {
+  window.ipcRenderer.off('vault:progress', onVaultProgress)
+})
 </script>
 
 <template>
@@ -186,16 +235,32 @@ onMounted(load)
       </div>
       <div class="flex shrink-0 items-center gap-2">
         <el-button type="primary" :icon="FolderAdd" @click="onAdd">添加文件</el-button>
+        <el-button :icon="Refresh" :disabled="freeBytes === 0" @click="onCompact">
+          整理保险柜
+        </el-button>
         <el-button :icon="Key" @click="pwdVisible = true">修改密码</el-button>
         <el-button :icon="Lock" @click="onLock">锁定</el-button>
         <SettingsDialog />
       </div>
     </header>
 
+    <!-- 进度 -->
+    <div
+      v-if="progress"
+      class="rounded-2xl border border-gray-200 bg-white px-5 py-3 shadow-sm dark:border-gray-700 dark:bg-gray-900"
+    >
+      <div class="mb-1 flex items-center justify-between text-xs text-gray-500 dark:text-gray-400">
+        <span>{{ progressLabel }}</span>
+        <span>{{ progressPercent }}%</span>
+      </div>
+      <el-progress :percentage="progressPercent" :stroke-width="8" :show-text="false" />
+    </div>
+
     <!-- 统计 -->
     <div class="flex items-center gap-4 text-sm text-gray-500 dark:text-gray-400">
       <span>共 {{ files.length }} 个文件</span>
       <span>占用 {{ formatSize(totalSize) }}</span>
+      <span v-if="freeBytes > 0">碎片 {{ formatSize(freeBytes) }}</span>
     </div>
 
     <!-- 文件表 -->

@@ -1,5 +1,6 @@
 #include "vault.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <cstddef>
 #include <cstring>
@@ -11,6 +12,11 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#else
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
 #endif
 
 namespace shinkuro {
@@ -31,6 +37,11 @@ constexpr size_t VAULT_HEADER_SIZE = 96;  // magic8 + ver4 + iter4 + salt16 + to
 constexpr size_t CHUNK_BUF = 1024 * 1024;
 constexpr size_t INDEX_MAX = 256 * 1024 * 1024;  // sanity cap on index blob
 
+// On-disk size of one file chunk: nonce(12) + data_len(8) + ciphertext + tag(16).
+constexpr uint64_t chunk_len(uint64_t data_size) {
+  return NONCE_SIZE + 8 + data_size + TAG_SIZE;
+}
+
 #ifdef _WIN32
 std::string win32_last_error() {
   DWORD err = GetLastError();
@@ -42,6 +53,142 @@ std::string win32_last_error() {
   while (!msg.empty() && (msg.back() == '\r' || msg.back() == '\n' || msg.back() == ' '))
     msg.pop_back();
   return "(" + std::to_string(err) + ") " + msg;
+}
+#endif
+
+// ---- Memory-mapped file view (read-only or read-write) ----
+// Used by compact() to move chunks around at memory speed without a temp copy.
+#ifdef _WIN32
+struct FileMap {
+  HANDLE file = INVALID_HANDLE_VALUE;
+  HANDLE mapping = nullptr;
+  uint8_t* data = nullptr;
+  uint64_t size = 0;
+
+  FileMap() = default;
+  FileMap(FileMap&& o) noexcept : file(o.file), mapping(o.mapping), data(o.data), size(o.size) {
+    o.file = INVALID_HANDLE_VALUE;
+    o.mapping = nullptr;
+    o.data = nullptr;
+    o.size = 0;
+  }
+  FileMap& operator=(FileMap&& o) noexcept {
+    if (this != &o) {
+      close();
+      file = o.file;
+      mapping = o.mapping;
+      data = o.data;
+      size = o.size;
+      o.file = INVALID_HANDLE_VALUE;
+      o.mapping = nullptr;
+      o.data = nullptr;
+      o.size = 0;
+    }
+    return *this;
+  }
+  FileMap(const FileMap&) = delete;
+  FileMap& operator=(const FileMap&) = delete;
+  ~FileMap() { close(); }
+
+  void close() {
+    if (data) {
+      UnmapViewOfFile(data);
+      data = nullptr;
+    }
+    if (mapping) {
+      CloseHandle(mapping);
+      mapping = nullptr;
+    }
+    if (file != INVALID_HANDLE_VALUE) {
+      CloseHandle(file);
+      file = INVALID_HANDLE_VALUE;
+    }
+    size = 0;
+  }
+  void flush() {
+    if (data) FlushViewOfFile(data, static_cast<SIZE_T>(size));
+  }
+};
+
+FileMap map_file(const std::filesystem::path& p, uint64_t size, bool write) {
+  FileMap m;
+  DWORD access = write ? (GENERIC_READ | GENERIC_WRITE) : GENERIC_READ;
+  DWORD protect = write ? PAGE_READWRITE : PAGE_READONLY;
+  DWORD view = write ? FILE_MAP_WRITE : FILE_MAP_READ;
+  m.file = CreateFileW(p.c_str(), access, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                       OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+  if (m.file == INVALID_HANDLE_VALUE)
+    throw VaultError("IO_ERROR", "无法打开保险柜文件: " + win32_last_error());
+  m.mapping = CreateFileMappingW(m.file, nullptr, protect, 0, 0, nullptr);
+  if (!m.mapping) {
+    m.close();
+    throw VaultError("IO_ERROR", "创建文件映射失败: " + win32_last_error());
+  }
+  m.data = static_cast<uint8_t*>(MapViewOfFile(m.mapping, view, 0, 0, static_cast<SIZE_T>(size)));
+  if (!m.data) {
+    m.close();
+    throw VaultError("IO_ERROR", "映射文件失败: " + win32_last_error());
+  }
+  m.size = size;
+  return m;
+}
+#else
+struct FileMap {
+  int fd = -1;
+  uint8_t* data = nullptr;
+  uint64_t size = 0;
+
+  FileMap() = default;
+  FileMap(FileMap&& o) noexcept : fd(o.fd), data(o.data), size(o.size) {
+    o.fd = -1;
+    o.data = nullptr;
+    o.size = 0;
+  }
+  FileMap& operator=(FileMap&& o) noexcept {
+    if (this != &o) {
+      close();
+      fd = o.fd;
+      data = o.data;
+      size = o.size;
+      o.fd = -1;
+      o.data = nullptr;
+      o.size = 0;
+    }
+    return *this;
+  }
+  FileMap(const FileMap&) = delete;
+  FileMap& operator=(const FileMap&) = delete;
+  ~FileMap() { close(); }
+
+  void close() {
+    if (data) {
+      munmap(data, static_cast<size_t>(size));
+      data = nullptr;
+    }
+    if (fd >= 0) {
+      ::close(fd);
+      fd = -1;
+    }
+    size = 0;
+  }
+  void flush() {
+    if (data) msync(data, static_cast<size_t>(size), MS_SYNC);
+  }
+};
+
+FileMap map_file(const std::filesystem::path& p, uint64_t size, bool write) {
+  FileMap m;
+  m.fd = ::open(p.c_str(), write ? O_RDWR : O_RDONLY);
+  if (m.fd < 0) throw VaultError("IO_ERROR", "无法打开保险柜文件");
+  void* d = ::mmap(nullptr, static_cast<size_t>(size),
+                   write ? (PROT_READ | PROT_WRITE) : PROT_READ, MAP_SHARED, m.fd, 0);
+  if (d == MAP_FAILED) {
+    m.close();
+    throw VaultError("IO_ERROR", "映射文件失败");
+  }
+  m.data = static_cast<uint8_t*>(d);
+  m.size = size;
+  return m;
 }
 #endif
 
@@ -93,14 +240,6 @@ int file_seek(FILE* f, uint64_t off) {
   return _fseeki64(f, static_cast<int64_t>(off), SEEK_SET);
 #else
   return fseeko(f, static_cast<off_t>(off), SEEK_SET);
-#endif
-}
-
-uint64_t file_tell(FILE* f) {
-#ifdef _WIN32
-  return static_cast<uint64_t>(_ftelli64(f));
-#else
-  return static_cast<uint64_t>(ftello(f));
 #endif
 }
 
@@ -214,6 +353,7 @@ void Vault::clear_keys() {
   secure_zero(salt_);
   iterations_ = 0;
   files_.clear();
+  free_.clear();
 }
 
 void Vault::lock() {
@@ -324,6 +464,7 @@ void Vault::create(const std::filesystem::path& vault_path, const std::string& p
   std::fclose(f);
 
   files_.clear();
+  free_.clear();
   open_ = true;
   try {
     write_index();
@@ -388,8 +529,20 @@ void Vault::open(const std::filesystem::path& vault_path, const std::string& pas
     if (e.offset < VAULT_HEADER_SIZE || need > vsize)
       throw VaultError("CORRUPT", "索引与保险柜数据不一致");
   }
+  for (const auto& r : free_) {
+    if (r.size == 0 || r.offset < VAULT_HEADER_SIZE || r.offset > vsize ||
+        r.size > vsize - r.offset)
+      throw VaultError("CORRUPT", "索引与保险柜数据不一致");
+  }
 
   open_ = true;
+  // Reclaim accumulated fragmentation once at open (never on the hot delete path),
+  // so opening a heavily-fragmented vault still ends up compact eventually.
+  try {
+    if (should_auto_compact()) compact();
+  } catch (const std::exception& e) {
+    std::fprintf(stderr, "[shinkuro] auto-compact failed: %s\n", e.what());
+  }
   temp_dir_ = make_temp_dir();
   acquire_locks();
 }
@@ -411,6 +564,15 @@ void Vault::write_index() {
     arr.push_back(std::move(o));
   }
   root["files"] = std::move(arr);
+
+  Json fr = Json::Array();
+  for (const auto& r : free_) {
+    Json o = Json::Object();
+    o["offset"] = static_cast<int64_t>(r.offset);
+    o["size"] = static_cast<int64_t>(r.size);
+    fr.push_back(std::move(o));
+  }
+  root["free"] = std::move(fr);
 
   std::string plain = root.dump();
   Bytes nonce = random_bytes(NONCE_SIZE);
@@ -496,6 +658,7 @@ void Vault::load_index() {
   }
 
   files_.clear();
+  free_.clear();
   for (const auto& item : root["files"].as_array()) {
     FileEntry e;
     e.name = item["name"].as_string();
@@ -504,6 +667,16 @@ void Vault::load_index() {
     e.mtime = item["mtime"].as_int();
     e.file_id = from_hex(item["id"].as_string());
     files_.push_back(std::move(e));
+  }
+  if (root.has("free")) {
+    for (const auto& item : root["free"].as_array()) {
+      FreeRange r;
+      r.offset = static_cast<uint64_t>(item["offset"].as_int());
+      r.size = static_cast<uint64_t>(item["size"].as_int());
+      if (r.size > 0 && r.offset >= VAULT_HEADER_SIZE) free_.push_back(r);
+    }
+    std::sort(free_.begin(), free_.end(),
+              [](const FreeRange& a, const FreeRange& b) { return a.offset < b.offset; });
   }
   secure_zero(plain);
 }
@@ -523,6 +696,8 @@ Json Vault::list() const {
   Json res = Json::Object();
   res["path"] = vault_path_.u8string();
   res["count"] = static_cast<int64_t>(files_.size());
+  res["physical_size"] = static_cast<int64_t>(vault_file_size());
+  res["free_bytes"] = static_cast<int64_t>(free_bytes());
   res["files"] = std::move(arr);
   return res;
 }
@@ -552,23 +727,40 @@ Json Vault::add(const std::filesystem::path& src_path) {
   Bytes file_id = random_bytes(FILE_ID_SIZE);
   Bytes nonce = random_bytes(NONCE_SIZE);
 
-  uint64_t offset = std::filesystem::file_size(vault_path_, ec);
+  // Reuse a freed hole when one fits; otherwise append at the end of the file.
+  uint64_t need = chunk_len(src_size);
+  uint64_t offset = 0;
+  size_t reuse_idx = free_.size();
+  bool reuse = find_free_fit(need, offset, reuse_idx);
 
   FILE* in = fopen_path(src_path, "rb");
   if (!in) throw VaultError("IO_ERROR", "无法读取源文件");
-  FILE* vf = fopen_path(vault_path_, "ab");
+
+  FILE* vf = nullptr;
+  if (reuse) {
+    vf = fopen_path(vault_path_, "rb+");
+    if (vf && file_seek(vf, offset) != 0) {
+      std::fclose(vf);
+      vf = nullptr;
+    }
+  } else {
+    offset = vault_file_size();
+    vf = fopen_path(vault_path_, "ab");
+  }
   if (!vf) {
     std::fclose(in);
-    throw VaultError("IO_ERROR", "无法打开保险柜文件");
+    throw VaultError("IO_ERROR", reuse ? "无法定位保险柜中的空闲空间" : "无法打开保险柜文件");
   }
 
   Bytes aad = file_id;
   append_u64(aad, src_size);
 
+  report("encrypt", 0, src_size);
   try {
     write_bytes(vf, nonce.data(), nonce.size());
     write_u64(vf, src_size);
-    gcm_encrypt_stream(chunk_key_, nonce, aad, in, vf);
+    gcm_encrypt_stream(chunk_key_, nonce, aad, in, vf,
+                       [&](uint64_t done) { report("encrypt", done, src_size); });
   } catch (...) {
     std::fclose(in);
     std::fclose(vf);
@@ -576,6 +768,8 @@ Json Vault::add(const std::filesystem::path& src_path) {
   }
   std::fclose(in);
   std::fclose(vf);
+
+  if (reuse) consume_free(reuse_idx, need);
 
   FileEntry e;
   e.name = name;
@@ -589,6 +783,7 @@ Json Vault::add(const std::filesystem::path& src_path) {
     write_index();
   } catch (...) {
     files_.pop_back();
+    if (reuse) add_free(offset, need);
     throw;
   }
 
@@ -662,7 +857,7 @@ Json Vault::extract_to(const std::string& name, const std::filesystem::path& des
   return o;
 }
 
-void Vault::remove(const std::string& name) {
+uint64_t Vault::remove(const std::string& name) {
   if (!open_) throw VaultError("NOT_OPEN", "保险柜未打开");
   size_t idx = files_.size();
   for (size_t i = 0; i < files_.size(); i++) {
@@ -673,62 +868,194 @@ void Vault::remove(const std::string& name) {
   }
   if (idx == files_.size()) throw VaultError("NOT_FOUND", "文件不存在: " + name);
 
-  std::vector<size_t> keep;
-  keep.reserve(files_.size() - 1);
-  for (size_t i = 0; i < files_.size(); i++)
-    if (i != idx) keep.push_back(i);
-
-  compact(keep);  // rewrites vault + updates offsets of kept entries
+  // O(1) lazy delete: mark the chunk as free instead of rewriting the whole
+  // vault. Trailing free space is truncated immediately, so deleting the newest
+  // file still shrinks the vault on the spot; interior holes are reused later.
+  uint64_t len = chunk_len(files_[idx].size);
+  uint64_t off = files_[idx].offset;
   files_.erase(files_.begin() + static_cast<std::ptrdiff_t>(idx));
+  add_free(off, len);
+  trim_trailing_free();
   write_index();
+  return len;
 }
 
-void Vault::compact(const std::vector<size_t>& keep) {
-  std::filesystem::path tmp = vault_path_;
-  tmp += ".tmp" + random_hex(8);
+// ---- Free-space management ----
 
-  FILE* oldf = fopen_path(vault_path_, "rb");
-  if (!oldf) throw VaultError("IO_ERROR", "无法打开保险柜文件");
-  FILE* newf = fopen_path(tmp, "wb");
-  if (!newf) {
-    std::fclose(oldf);
-    throw VaultError("IO_ERROR", "无法创建临时文件");
-  }
+uint64_t Vault::free_bytes() const {
+  uint64_t total = 0;
+  for (const auto& r : free_) total += r.size;
+  return total;
+}
 
-  std::vector<uint64_t> new_offsets(files_.size(), 0);
-  std::exception_ptr err;
-  try {
-    copy_bytes(oldf, newf, VAULT_HEADER_SIZE);  // header verbatim
-    for (size_t i : keep) {
-      const FileEntry& e = files_[i];
-      if (file_seek(oldf, e.offset) != 0) throw VaultError("IO_ERROR", "定位数据失败");
-      new_offsets[i] = file_tell(newf);
-      copy_bytes(oldf, newf, NONCE_SIZE + 8 + e.size + TAG_SIZE);
+uint64_t Vault::vault_file_size() const {
+  std::error_code ec;
+  uint64_t sz = std::filesystem::file_size(vault_path_, ec);
+  if (ec) throw VaultError("IO_ERROR", "读取保险柜文件大小失败: " + ec.message());
+  return sz;
+}
+
+void Vault::add_free(uint64_t offset, uint64_t size) {
+  if (size == 0) return;
+  FreeRange r{offset, size};
+  auto it = std::lower_bound(free_.begin(), free_.end(), r,
+                             [](const FreeRange& a, const FreeRange& b) {
+                               return a.offset < b.offset;
+                             });
+  free_.insert(it, r);
+  // Coalesce overlapping/adjacent ranges so free_ stays minimal and sorted.
+  for (size_t i = 0; i + 1 < free_.size();) {
+    FreeRange& a = free_[i];
+    FreeRange& b = free_[i + 1];
+    if (a.offset + a.size >= b.offset) {
+      uint64_t end = std::max(a.offset + a.size, b.offset + b.size);
+      a.size = end - a.offset;
+      free_.erase(free_.begin() + static_cast<std::ptrdiff_t>(i + 1));
+    } else {
+      i++;
     }
-  } catch (...) {
-    err = std::current_exception();
   }
-  std::fclose(newf);
-  std::fclose(oldf);
+}
 
-  if (err) {
-    std::error_code ec;
-    std::filesystem::remove(tmp, ec);
-    std::rethrow_exception(err);
+bool Vault::find_free_fit(uint64_t need, uint64_t& out_offset, size_t& out_idx) const {
+  out_idx = free_.size();
+  out_offset = 0;
+  int64_t best = -1;
+  for (size_t i = 0; i < free_.size(); i++) {
+    if (free_[i].size >= need) {
+      if (best < 0 || free_[i].size < free_[static_cast<size_t>(best)].size)
+        best = static_cast<int64_t>(i);
+    }
+  }
+  if (best < 0) return false;
+  out_idx = static_cast<size_t>(best);
+  out_offset = free_[out_idx].offset;
+  return true;
+}
+
+void Vault::consume_free(size_t idx, uint64_t need) {
+  FreeRange& r = free_[idx];
+  r.offset += need;
+  r.size -= need;
+  if (r.size == 0) free_.erase(free_.begin() + static_cast<std::ptrdiff_t>(idx));
+}
+
+void Vault::trim_trailing_free() {
+  uint64_t vsize = vault_file_size();
+  while (!free_.empty()) {
+    const FreeRange& last = free_.back();
+    if (last.offset + last.size < vsize) break;  // interior hole, keep it
+    if (last.offset >= vsize) {                  // defensive: fully past EOF
+      free_.pop_back();
+      continue;
+    }
+    truncate_vault(last.offset);  // reclaim trailing free space
+    vsize = last.offset;
+    free_.pop_back();
+  }
+}
+
+void Vault::truncate_vault(uint64_t size) {
+#ifdef _WIN32
+  HANDLE h = CreateFileW(vault_path_.c_str(), GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                         nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+  if (h == INVALID_HANDLE_VALUE)
+    throw VaultError("IO_ERROR", "无法打开保险柜文件以截断: " + win32_last_error());
+  LARGE_INTEGER li;
+  li.QuadPart = static_cast<LONGLONG>(size);
+  BOOL ok1 = SetFilePointerEx(h, li, nullptr, FILE_BEGIN);
+  BOOL ok2 = SetEndOfFile(h);
+  DWORD err = GetLastError();
+  CloseHandle(h);
+  if (!ok1 || !ok2)
+    throw VaultError("IO_ERROR", "截断保险柜文件失败: (" + std::to_string(err) + ")");
+#else
+  if (::truncate(vault_path_.c_str(), static_cast<off_t>(size)) != 0)
+    throw VaultError("IO_ERROR", "截断保险柜文件失败");
+#endif
+}
+
+void Vault::report(const std::string& phase, uint64_t done, uint64_t total) {
+  if (progress_) progress_(phase, done, total);
+}
+
+bool Vault::should_auto_compact() const {
+  uint64_t free = free_bytes();
+  uint64_t vsize = vault_file_size();
+  constexpr uint64_t MIN_FREE = 64ull * 1024 * 1024;  // 64 MiB
+  if (free < MIN_FREE || vsize == 0) return false;
+  return free >= vsize / 4;  // fragmentation ≥ 25% of the file
+}
+
+Json Vault::compact() {
+  if (!open_) throw VaultError("NOT_OPEN", "保险柜未打开");
+  uint64_t before = vault_file_size();
+
+  if (files_.empty()) {
+    if (before > VAULT_HEADER_SIZE) truncate_vault(VAULT_HEADER_SIZE);
+    free_.clear();
+    write_index();
+    Json o = Json::Object();
+    o["before"] = static_cast<int64_t>(before);
+    o["after"] = static_cast<int64_t>(VAULT_HEADER_SIZE);
+    o["freed"] = static_cast<int64_t>(before - VAULT_HEADER_SIZE);
+    return o;
   }
 
-  release_vault_lock();
-  try {
-    atomic_replace(tmp, vault_path_);
-  } catch (...) {
-    acquire_vault_lock();
-    std::error_code ec2;
-    std::filesystem::remove(tmp, ec2);
-    throw;
-  }
-  acquire_vault_lock();
+  // Sort kept files by their current offset, then move each chunk left to fill
+  // the holes. Every chunk only moves left and we process left→right, so a move's
+  // destination never overlaps a later chunk's source — memmove stays correct.
+  std::vector<size_t> order(files_.size());
+  for (size_t i = 0; i < order.size(); i++) order[i] = i;
+  std::sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+    return files_[a].offset < files_[b].offset;
+  });
 
-  for (size_t i : keep) files_[i].offset = new_offsets[i];
+  FileMap view = map_file(vault_path_, before, /*write=*/true);
+  uint8_t* base = view.data;
+  uint64_t write_off = VAULT_HEADER_SIZE;
+  std::vector<uint64_t> new_offsets(files_.size(), 0);
+
+  uint64_t total = 0;
+  for (const auto& e : files_) total += chunk_len(e.size);
+  report("compact", 0, total);
+  uint64_t done = 0;
+  constexpr uint64_t STEP = 32ull * 1024 * 1024;  // 32 MiB per memmove step
+
+  for (size_t i : order) {
+    const FileEntry& e = files_[i];
+    uint64_t len = chunk_len(e.size);
+    if (e.offset != write_off) {
+      uint64_t off = 0;
+      while (off < len) {
+        uint64_t n = std::min<uint64_t>(STEP, len - off);
+        std::memmove(base + write_off + off, base + e.offset + off, static_cast<size_t>(n));
+        off += n;
+        done += n;
+        report("compact", done, total);
+      }
+    } else {
+      done += len;
+      report("compact", done, total);
+    }
+    new_offsets[i] = write_off;
+    write_off += len;
+  }
+  uint64_t after = write_off;
+
+  view.flush();
+  view.close();  // unmap before truncating
+  if (after != before) truncate_vault(after);
+
+  for (size_t i = 0; i < files_.size(); i++) files_[i].offset = new_offsets[i];
+  free_.clear();
+  write_index();
+
+  Json o = Json::Object();
+  o["before"] = static_cast<int64_t>(before);
+  o["after"] = static_cast<int64_t>(after);
+  o["freed"] = static_cast<int64_t>(before - after);
+  return o;
 }
 
 void Vault::change_password(const std::string& old_password, const std::string& new_password) {
@@ -769,9 +1096,23 @@ void Vault::change_password(const std::string& old_password, const std::string& 
   }
 
   std::exception_ptr err;
+  std::vector<uint64_t> new_offsets(files_.size(), 0);
   try {
     copy_bytes(oldf, newf, VAULT_HEADER_SIZE);  // header verbatim（salt/iterations 不变）
-    for (const auto& e : files_) {
+    // 按磁盘顺序重排并紧排写入：改密的同时消除碎片，且偏移与新布局保持一致。
+    std::vector<size_t> order(files_.size());
+    for (size_t i = 0; i < order.size(); i++) order[i] = i;
+    std::sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+      return files_[a].offset < files_[b].offset;
+    });
+    uint64_t total = 0;
+    for (const auto& e : files_) total += e.size;
+    report("reencrypt", 0, total);
+    uint64_t processed = 0;
+
+    uint64_t new_off = VAULT_HEADER_SIZE;
+    for (size_t i : order) {
+      const FileEntry& e = files_[i];
       if (file_seek(oldf, e.offset) != 0) throw VaultError("IO_ERROR", "定位数据失败");
       Bytes nonce(NONCE_SIZE);
       read_bytes(oldf, nonce.data(), nonce.size());
@@ -780,11 +1121,16 @@ void Vault::change_password(const std::string& old_password, const std::string& 
       Bytes aad = e.file_id;
       append_u64(aad, e.size);
       Bytes new_nonce = random_bytes(NONCE_SIZE);
+      new_offsets[i] = new_off;
+      new_off += NONCE_SIZE + 8 + data_len + TAG_SIZE;
       write_bytes(newf, new_nonce.data(), new_nonce.size());
       write_u64(newf, data_len);
       try {
+        uint64_t base = processed;
         gcm_reencrypt_stream(chunk_key_, nonce, aad, new_chunk_key, new_nonce, oldf, newf,
-                             data_len);
+                             data_len,
+                             [&](uint64_t done) { report("reencrypt", base + done, total); });
+        processed += data_len;
       } catch (const AuthError&) {
         throw VaultError("CORRUPT", "数据校验失败，保险柜可能被篡改");
       }
@@ -825,6 +1171,10 @@ void Vault::change_password(const std::string& old_password, const std::string& 
   idx_key_ = std::move(new_idx_key);
   secure_zero(chunk_key_);
   chunk_key_ = std::move(new_chunk_key);
+
+  // 新文件已紧排，同步偏移并清空碎片表。
+  for (size_t i = 0; i < files_.size(); i++) files_[i].offset = new_offsets[i];
+  free_.clear();
 
   write_index();
 }

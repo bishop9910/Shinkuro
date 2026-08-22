@@ -62,10 +62,11 @@ chunk_key  = HKDF-SHA256(master_key, "SKchnkv1", pair_token, 32B)
 
 - 每个文件块用独立的随机 nonce，AES-256-GCM 认证加密，AAD = file_id(16) + data_len(8)。
 - GCM 不填充，`ciphertext 长度 == 明文长度`。
-- **添加文件**：向 `.vault` 末尾追加一个块 → 文件变大（增容）。
-- **删除文件**：重写 `.vault`，只复制保留块、顺次紧排 → 文件变小（缩水）；复制是逐字节搬运，
-  无需重新加解密，效率高。
-- 删除后立即重写索引，保证「删除即缩水、即持久化」。
+- **添加文件**：优先复用索引里记录的空闲洞（best-fit），没有再向 `.vault` 末尾追加一个块。
+- **删除文件**：O(1) 惰性删除——只把该块标记为空闲并重写小索引，不再整文件重写；
+  若删除的是文件末尾的块，则立即截断文件实现「删除即缩水」。中间留下的洞会被后续添加复用，
+  避免大保险柜删除一个文件也要 O(整个文件) 拷贝、还额外占用等量临时空间的问题。
+- 空闲洞（含跨文件合并）随索引持久化，`compact` 操作用 mmap 原地搬移把洞消除、真正缩水。
 
 ### `.idx` 布局
 
@@ -76,12 +77,23 @@ magic(8) | version(4) | pair_token(32) | nonce(12) | cipher_len(8) | ciphertext 
 解密后为 JSON：
 
 ```json
-{ "version": 1, "pair_token": "<hex>", "files": [ { "name": "a.pdf", "size": 1234, "offset": 96, "mtime": 1700000000, "id": "<hex>" } ] }
+{ "version": 1, "pair_token": "<hex>",
+  "files": [ { "name": "a.pdf", "size": 1234, "offset": 96, "mtime": 1700000000, "id": "<hex>" } ],
+  "free": [ { "offset": 1340, "size": 5678 } ] }
 ```
+
+> `free` 为可复用的空闲区间（字节偏移 + 长度），旧版索引没有该字段时按空处理，向前兼容。
 
 ## RPC 协议
 
-每行一个 JSON 请求，响应一行 JSON。
+每行一个 JSON 请求，响应一行 JSON。长耗时操作（`add` / `compact` / `change_password`）期间，
+后端会额外输出与请求相同 `id` 的进度通知行（无 `ok`/`result`），供 Electron 主进程转发给前端进度条：
+
+```json
+{"id":2,"progress":{"phase":"encrypt","done":1048576,"total":4194304}}
+```
+
+`phase` 取值：`encrypt`（添加加密）、`compact`（整理）、`reencrypt`（改密重加密）。
 
 ```json
 {"id":1,"method":"create","params":{"path":"D:/a.vault","password":"pw"}}
@@ -93,6 +105,7 @@ magic(8) | version(4) | pair_token(32) | nonce(12) | cipher_len(8) | ciphertext 
 {"id":1,"method":"extract_to","params":{"name":"file.pdf","dest":"D:/out/file.pdf"}}
 {"id":1,"method":"change_password","params":{"old_password":"old","new_password":"new"}}
 {"id":1,"method":"delete","params":{"name":"file.pdf"}}
+{"id":1,"method":"compact"}
 {"id":1,"method":"shutdown"}
 ```
 

@@ -6,10 +6,11 @@
 //   create {path,password}  -> {open, path}
 //   open   {path,password}  -> {open, path}
 //   lock                    -> {open:false}
-//   list                    -> {path, count, files:[{name,size,mtime}]}
+//   list                    -> {path, count, files:[{name,size,mtime}], physical_size, free_bytes}
 //   add    {src}            -> {name,size,mtime}
 //   extract{name}           -> {path,name,size}  (decrypted temp file)
-//   delete {name}           -> {ok:true}
+//   delete {name}           -> {ok:true,freed}
+//   compact                 -> {before,after,freed}  (defrag/shrink the vault)
 //   shutdown                -> {shutdown:true} then exits
 //
 // Every response is a single JSON line:
@@ -39,8 +40,25 @@ static Json make_error(const std::string& code, const std::string& message) {
   return e;
 }
 
+// Emits a progress notification (same id as the in-flight request) so the
+// Electron main process can forward it to the renderer's progress bar.
+static void emit_progress(int64_t id, const std::string& phase, uint64_t done, uint64_t total) {
+  Json p = Json::Object();
+  p["id"] = id;
+  Json pr = Json::Object();
+  pr["phase"] = phase;
+  pr["done"] = static_cast<int64_t>(done);
+  pr["total"] = static_cast<int64_t>(total);
+  p["progress"] = pr;
+  std::cout << p.dump() << "\n" << std::flush;
+}
+
 // Executes one RPC method and returns its result (throws on failure).
-static Json call(const std::string& method, const Json& params) {
+static Json call(const std::string& method, const Json& params, int64_t id) {
+  g_vault.set_progress_callback(
+      [id](const std::string& phase, uint64_t done, uint64_t total) {
+        emit_progress(id, phase, done, total);
+      });
   if (method == "ping") {
     Json r = Json::Object();
     r["pong"] = true;
@@ -101,10 +119,14 @@ static Json call(const std::string& method, const Json& params) {
     return r;
   }
   if (method == "delete") {
-    g_vault.remove(params["name"].as_string());
+    uint64_t freed = g_vault.remove(params["name"].as_string());
     Json r = Json::Object();
     r["ok"] = true;
+    r["freed"] = static_cast<int64_t>(freed);
     return r;
+  }
+  if (method == "compact") {
+    return g_vault.compact();
   }
   if (method == "shutdown") {
     g_vault.lock();
@@ -154,11 +176,12 @@ int main() {
       continue;
     }
 
+    int64_t rid = id.is_int() ? id.as_int() : 0;
     Json resp = Json::Object();
     resp["id"] = id;
     try {
       resp["ok"] = true;
-      resp["result"] = call(method, params);
+      resp["result"] = call(method, params, rid);
     } catch (const VaultError& ve) {
       resp["ok"] = false;
       resp["error"] = make_error(ve.code, ve.what());

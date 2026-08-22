@@ -60,6 +60,10 @@ export function deleteFile(name: string): Promise<{ ok: boolean }> {
   return call('vault:delete', name)
 }
 
+export function compactVault(): Promise<{ before: number; after: number; freed: number }> {
+  return call('vault:compact')
+}
+
 export function extractTo(
   name: string
 ): Promise<{ canceled: boolean; path?: string; name?: string; size?: number }> {

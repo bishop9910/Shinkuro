@@ -11,6 +11,7 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -26,6 +27,9 @@ struct VaultError : std::runtime_error {
   VaultError(std::string c, const std::string& msg) : std::runtime_error(msg), code(std::move(c)) {}
 };
 
+// Phase names: "encrypt" (add), "compact" (defrag), "reencrypt" (change password).
+using ProgressFn = std::function<void(const std::string& phase, uint64_t done, uint64_t total)>;
+
 class Vault {
 public:
   struct FileEntry {
@@ -34,6 +38,12 @@ public:
     uint64_t offset = 0;
     int64_t mtime = 0;
     Bytes file_id;  // 16 random bytes; used as chunk AAD
+  };
+
+  // A reusable hole in the vault file (in bytes, offset relative to file start).
+  struct FreeRange {
+    uint64_t offset = 0;
+    uint64_t size = 0;
   };
 
   Vault() = default;
@@ -55,8 +65,12 @@ public:
   Json extract(const std::string& name);  // returns {path, name, size} (to temp dir)
   Json extract_to(const std::string& name,
                   const std::filesystem::path& dest);  // returns {path, name, size}
-  void remove(const std::string& name);                // deletes + compacts (shrinks) the vault
+  uint64_t remove(const std::string& name);  // O(1) lazy delete; returns bytes reclaimed
+  Json compact();                            // defrag/shrink: returns {before, after, freed}
   void change_password(const std::string& old_password, const std::string& new_password);
+
+  // Optional progress reporting for long-running ops (add/compact/change_password).
+  void set_progress_callback(ProgressFn fn) { progress_ = std::move(fn); }
 
 private:
   bool open_ = false;
@@ -67,7 +81,9 @@ private:
   Bytes salt_;
   uint32_t iterations_ = 0;
   std::vector<FileEntry> files_;
+  std::vector<FreeRange> free_;  // sorted-by-offset, coalesced reusable holes
   std::filesystem::path temp_dir_;
+  ProgressFn progress_;
 
 #ifdef _WIN32
   void* vault_lock_ = nullptr;  // denies deletion of the vault file while open
@@ -78,10 +94,20 @@ private:
   void clear_keys();
   void write_index();
   void load_index();
-  void compact(const std::vector<size_t>& keep);
   void decrypt_to(const FileEntry& e, const std::filesystem::path& out_path);
   std::filesystem::path make_temp_dir();
   void wipe_temp_dir();
+
+  // Free-space management (lazy delete / reuse).
+  void add_free(uint64_t offset, uint64_t size);
+  bool find_free_fit(uint64_t need, uint64_t& out_offset, size_t& out_idx) const;
+  void consume_free(size_t idx, uint64_t need);
+  void trim_trailing_free();
+  uint64_t free_bytes() const;
+  uint64_t vault_file_size() const;
+  void truncate_vault(uint64_t size);
+  bool should_auto_compact() const;
+  void report(const std::string& phase, uint64_t done, uint64_t total);
 
   void acquire_locks();
   void release_locks();

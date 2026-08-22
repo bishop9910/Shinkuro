@@ -2,7 +2,7 @@
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
 import path from 'node:path'
 import fs from 'node:fs'
-import { app, dialog, ipcMain, shell } from 'electron'
+import { app, BrowserWindow, dialog, ipcMain, shell } from 'electron'
 
 export type VaultEntry = { name: string; size: number; mtime: number }
 export type VaultList = { path: string; count: number; files: VaultEntry[] }
@@ -61,6 +61,20 @@ function ensureBackend(): ChildProcessWithoutNullStreams {
       if (!line) continue
       try {
         const msg = JSON.parse(line)
+        // Progress notifications share the in-flight request id but carry no
+        // ok/result: forward them to the renderer instead of resolving pending.
+        if (msg.progress) {
+          const payload = {
+            id: msg.id,
+            phase: msg.progress.phase,
+            done: msg.progress.done,
+            total: msg.progress.total,
+          }
+          for (const w of BrowserWindow.getAllWindows()) {
+            w.webContents.send('vault:progress', payload)
+          }
+          continue
+        }
         const p = pending.get(msg.id)
         if (p) {
           pending.delete(msg.id)
@@ -219,6 +233,14 @@ export function registerVaultIpc() {
   ipcMain.handle('vault:delete', async (_e, name: string) => {
     try {
       return ok(await request('delete', { name }))
+    } catch (e) {
+      return fail(e)
+    }
+  })
+
+  ipcMain.handle('vault:compact', async () => {
+    try {
+      return ok(await request<{ before: number; after: number; freed: number }>('compact'))
     } catch (e) {
       return fail(e)
     }

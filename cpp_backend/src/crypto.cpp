@@ -154,7 +154,7 @@ Bytes gcm_decrypt(const Bytes& key, const Bytes& nonce, const Bytes& aad, const 
 }
 
 void gcm_encrypt_stream(const Bytes& key, const Bytes& nonce, const Bytes& aad, FILE* in,
-                        FILE* out) {
+                        FILE* out, Progress progress) {
   EVP_CIPHER_CTX* raw = EVP_CIPHER_CTX_new();
   if (!raw) throw CryptoError("EVP_CIPHER_CTX_new failed");
   CtxGuard guard(raw);
@@ -172,6 +172,7 @@ void gcm_encrypt_stream(const Bytes& key, const Bytes& nonce, const Bytes& aad, 
     throw CryptoError("AAD update failed");
 
   std::vector<uint8_t> inbuf(CHUNK), outbuf(CHUNK + 16);
+  uint64_t done = 0;
   while (true) {
     size_t n = std::fread(inbuf.data(), 1, CHUNK, in);
     if (n == 0) break;
@@ -179,6 +180,8 @@ void gcm_encrypt_stream(const Bytes& key, const Bytes& nonce, const Bytes& aad, 
     if (EVP_EncryptUpdate(raw, outbuf.data(), &out_len, inbuf.data(), static_cast<int>(n)) != 1)
       throw CryptoError("encrypt update failed");
     if (out_len > 0) std::fwrite(outbuf.data(), 1, out_len, out);
+    done += n;
+    if (progress) progress(done);
     if (n < CHUNK) break;  // EOF
   }
   int final_len = 0;
@@ -238,7 +241,7 @@ void gcm_decrypt_stream(const Bytes& key, const Bytes& nonce, const Bytes& aad, 
 
 void gcm_reencrypt_stream(const Bytes& old_key, const Bytes& old_nonce, const Bytes& aad,
                           const Bytes& new_key, const Bytes& new_nonce, FILE* in, FILE* out,
-                          uint64_t cipher_len) {
+                          uint64_t cipher_len, Progress progress) {
   EVP_CIPHER_CTX* d_ctx = EVP_CIPHER_CTX_new();
   EVP_CIPHER_CTX* e_ctx = EVP_CIPHER_CTX_new();
   if (!d_ctx || !e_ctx) {
@@ -274,6 +277,7 @@ void gcm_reencrypt_stream(const Bytes& old_key, const Bytes& old_nonce, const By
 
   std::vector<uint8_t> inbuf(CHUNK), plain(CHUNK + 16), outbuf(CHUNK + 16);
   uint64_t remaining = cipher_len;
+  uint64_t done = 0;
   while (remaining > 0) {
     size_t want = static_cast<size_t>(remaining < CHUNK ? remaining : CHUNK);
     size_t n = std::fread(inbuf.data(), 1, want, in);
@@ -286,6 +290,8 @@ void gcm_reencrypt_stream(const Bytes& old_key, const Bytes& old_nonce, const By
       throw CryptoError("encrypt update failed");
     if (out_len > 0) std::fwrite(outbuf.data(), 1, out_len, out);
     remaining -= n;
+    done += n;
+    if (progress) progress(done);
   }
 
   // verify old tag

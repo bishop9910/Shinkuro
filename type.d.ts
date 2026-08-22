@@ -17,6 +17,8 @@ export type VaultList = {
   path: string;
   count: number;
   files: VaultEntry[];
+  physical_size?: number;
+  free_bytes?: number;
 }
 
 export type OpenState = {
