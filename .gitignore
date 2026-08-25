@@ -16,6 +16,7 @@ release
 
 # C++ backend build output
 cpp_backend/build/
+cpp_backend/.vscode
 
 # Editor directories and files
 .vscode/.debug.env
