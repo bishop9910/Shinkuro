@@ -177,7 +177,7 @@ const { appendLoading, removeLoading } = useLoading();
 domReady().then(appendLoading);
 //收到remove消息立即移除加载页面
 window.onmessage = (ev: { data: { payload: string } }) => {
-  ev.data.payload === 'removeLoading' && setTimeout(removeLoading, 200);
+  ev.data.payload === 'removeLoading' && setTimeout(removeLoading, 600);
 }
 //兜底 5s后自动移除页面
 setTimeout(removeLoading, 4999);
