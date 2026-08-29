@@ -63,26 +63,48 @@ chunk_key  = HKDF-SHA256(master_key, "SKchnkv1", pair_token, 32B)
 - 每个文件块用独立的随机 nonce，AES-256-GCM 认证加密，AAD = file_id(16) + data_len(8)。
 - GCM 不填充，`ciphertext 长度 == 明文长度`。
 - **添加文件**：优先复用索引里记录的空闲洞（best-fit），没有再向 `.vault` 末尾追加一个块。
-- **删除文件**：O(1) 惰性删除——只把该块标记为空闲并重写小索引，不再整文件重写；
-  若删除的是文件末尾的块，则立即截断文件实现「删除即缩水」。中间留下的洞会被后续添加复用，
-  避免大保险柜删除一个文件也要 O(整个文件) 拷贝、还额外占用等量临时空间的问题。
-- 空闲洞（含跨文件合并）随索引持久化，`compact` 操作用 mmap 原地搬移把洞消除、真正缩水。
+- **删除文件**：O(1) 惰性删除——先原子提交索引（把该块标记为空闲），再截断文件尾部实现
+  「删除即缩水」。中间留下的洞会被后续添加复用，避免大保险柜删除一个文件也要 O(整个文件) 拷贝。
+- 空闲洞（含跨文件合并）随索引持久化，`compact` 用「临时文件 + 原子替换」把洞消除、真正缩水。
 
-### `.idx` 布局
+### `.idx` 布局（version 2，加密 B+ 树）
+
+索引文件是**定长页**的序列，每个树节点一页、独立 AES-256-GCM 加密，页 id 即物理槽位：
 
 ```
-magic(8) | version(4) | pair_token(32) | nonce(12) | cipher_len(8) | ciphertext | tag(16)
+[0..63]    固定头（明文）：
+            magic(8)="SKIDX002" | version(4)=2 | pair_token(32)
+            page_size(4)=4096 | generation(8) | reserved(8)
+[64..255]  两个 superblock 槽（各 96B）：
+            nonce(12) | GCM(superblock 64B) | tag(16) | pad
+[256..]    页槽位区：槽 1..N，每槽 = nonce(12) | GCM(页 4096B) | tag(16)
 ```
 
-解密后为 JSON：
+- 文件按文件名（UTF-8 字节字典序）组织成 B+ 树，值 = `{size,offset,mtime,file_id,seq}`；
+  空闲区间（`free`）按 offset 组织成第二棵 B+ 树。
+- **superblock** 携带单调递增的 `seq`、两棵树的根页 id、`next_page` 高水位、文件/空洞计数和
+  `generation`；双槽取 `seq` 较大者为活动槽。页 AAD 绑定 `magic+version+pair_token+page_id`，
+  防止页被整体搬移/替换。
+- **原子提交（copy-on-write）**：一次增删只改写「根→叶」路径上的 O(log N) 个页，新页写入新槽位
+  （绝不原地覆盖），最后把新 superblock 写入非活动槽并 `fsync`。任何时刻崩溃，磁盘上都有一个
+  完整可用的索引版本（旧 superblock 或新 superblock）。页空间为 append-only，`compact` /
+  `change_password` / 自动 reindex 会整树紧排重建以回收泄漏页。
+- 旧版（version 1）JSON 索引在打开时**自动迁移**为 B+ 树，向前兼容。
 
-```json
-{ "version": 1, "pair_token": "<hex>",
-  "files": [ { "name": "a.pdf", "size": 1234, "offset": 96, "mtime": 1700000000, "id": "<hex>" } ],
-  "free": [ { "offset": 1340, "size": 5678 } ] }
-```
+## 原子性与崩溃恢复
 
-> `free` 为可复用的空闲区间（字节偏移 + 长度），旧版索引没有该字段时按空处理，向前兼容。
+- 索引的每次变更（增/删文件、变更空洞表）都是**原子**的：copy-on-write + 双槽 superblock +
+  `fsync`，崩溃只会落在「旧状态」或「新状态」，绝不会出现半写坏的索引。
+- `add` 先写内容块、后提交索引：崩溃只会留下一个孤儿块（下次 `open` 时按引用范围自动截掉尾部），
+  不会破坏数据。
+- `delete` 先提交索引（标记空闲）、后截断尾部：截断是幂等的，崩溃后 `open` 自愈。
+- `compact` / `change_password` 会同时替换 `.vault` 与 `.idx` 两个文件：采用
+  「写 `*.tmp` → `fsync` → 备份 `*.old` → 重命名替换 → 删除 `*.old`」，并在两个文件头各写入一个
+  单调递增的 **`generation`**。`open()` 时若发现残留 `*.old`/`*.tmp`，比较两侧明文 `generation`：
+  - 一致 → 视为已完整提交，清理残留；
+  - 不一致 → 回滚到 `*.old` 备份对（`change_password` 撕裂时需用旧密码重试）。
+- 因此任何时刻进程崩溃，下次打开都能恢复到一致状态（要么新态、要么经备份回滚的旧态），
+  RPC 协议与错误码保持不变。
 
 ## RPC 协议
 

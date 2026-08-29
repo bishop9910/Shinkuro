@@ -2,50 +2,32 @@
 //
 // A vault is a pair of files:
 //   <name>.vault     encrypted file content (header + AES-256-GCM chunks)
-//   <name>.vault.idx authenticated, encrypted index (AES-256-GCM)
+//   <name>.vault.idx authenticated, encrypted B+ tree index
 //
 // The two files are strongly bound by a random 32-byte pair token stored in both
 // headers, and both are keyed off the master password. A mismatched or swapped
-// index will fail authentication.
+// index will fail authentication. A monotonic `generation` stored in both files
+// lets open() detect and recover from an interrupted compact/change_password.
 #pragma once
 
 #include <cstdint>
 #include <filesystem>
 #include <functional>
-#include <stdexcept>
 #include <string>
 #include <vector>
 
 #include "crypto.hpp"
+#include "index.hpp"
 #include "json.hpp"
 #include "util.hpp"
 
 namespace shinkuro {
-
-struct VaultError : std::runtime_error {
-  std::string code;
-  VaultError(std::string c, const std::string& msg) : std::runtime_error(msg), code(std::move(c)) {}
-};
 
 // Phase names: "encrypt" (add), "compact" (defrag), "reencrypt" (change password).
 using ProgressFn = std::function<void(const std::string& phase, uint64_t done, uint64_t total)>;
 
 class Vault {
 public:
-  struct FileEntry {
-    std::string name;
-    uint64_t size = 0;
-    uint64_t offset = 0;
-    int64_t mtime = 0;
-    Bytes file_id;  // 16 random bytes; used as chunk AAD
-  };
-
-  // A reusable hole in the vault file (in bytes, offset relative to file start).
-  struct FreeRange {
-    uint64_t offset = 0;
-    uint64_t size = 0;
-  };
-
   Vault() = default;
   ~Vault() { lock(); }
 
@@ -80,8 +62,10 @@ private:
   Bytes pair_token_;
   Bytes salt_;
   uint32_t iterations_ = 0;
+  uint64_t generation_ = 0;
   std::vector<FileEntry> files_;
   std::vector<FreeRange> free_;  // sorted-by-offset, coalesced reusable holes
+  Index index_;
   std::filesystem::path temp_dir_;
   ProgressFn progress_;
 
@@ -92,8 +76,19 @@ private:
 
   void derive_keys(const std::string& password, const Bytes& salt, uint32_t iterations);
   void clear_keys();
-  void write_index();
-  void load_index();
+  void read_vault_header();
+  void load_index_v2();
+  void load_index_legacy();
+  void rebuild_mirrors();
+  void commit_index();
+  void reload_index_state();
+  void write_vault_header(FILE* f, uint64_t gen);
+  void migrate_legacy_index();
+  std::string read_index_magic() const;
+  void recover_files();
+  void swap_pair_in();
+  void trim_trailing_garbage();
+  void maybe_auto_reindex();
   void decrypt_to(const FileEntry& e, const std::filesystem::path& out_path);
   std::filesystem::path make_temp_dir();
   void wipe_temp_dir();
@@ -113,6 +108,8 @@ private:
   void release_locks();
   void release_vault_lock();
   void acquire_vault_lock();
+  void release_idx_lock();
+  void acquire_idx_lock();
 
   FileEntry* find(const std::string& name);
   const FileEntry* find(const std::string& name) const;

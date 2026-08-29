@@ -19,7 +19,7 @@ REM ============================================================================
 REM Always switch to this script's own directory so relative paths resolve.
 cd /d "%~dp0"
 
-set "SRC=src\main.cpp src\vault.cpp src\crypto.cpp"
+set "SRC=src\main.cpp src\vault.cpp src\index.cpp src\crypto.cpp"
 set "OUT=build"
 if not exist "%OUT%" mkdir "%OUT%"
 

@@ -16,7 +16,7 @@ set -e
 # Switch to this script's own directory so relative paths resolve.
 cd "$(dirname "$0")"
 
-SRC="src/main.cpp src/vault.cpp src/crypto.cpp"
+SRC="src/main.cpp src/vault.cpp src/index.cpp src/crypto.cpp"
 OUT="build"
 mkdir -p "$OUT"
 
