@@ -88,6 +88,10 @@ private:
   void recover_files();
   void swap_pair_in();
   void trim_trailing_garbage();
+  // Pops the in-memory holes that reach the end of the vault and returns the
+  // size the .vault file must be shrunk to (0 = keep the current tail). Only the
+  // in-memory table is touched: callers persist first, truncate afterwards.
+  uint64_t reclaim_trailing_free();
   void maybe_auto_reindex();
   void decrypt_to(const FileEntry& e, const std::filesystem::path& out_path);
   std::filesystem::path make_temp_dir();
@@ -97,7 +101,6 @@ private:
   void add_free(uint64_t offset, uint64_t size);
   bool find_free_fit(uint64_t need, uint64_t& out_offset, size_t& out_idx) const;
   void consume_free(size_t idx, uint64_t need);
-  void trim_trailing_free();
   uint64_t free_bytes() const;
   uint64_t vault_file_size() const;
   void truncate_vault(uint64_t size);

@@ -685,7 +685,11 @@ void Vault::swap_pair_in() {
 }
 
 void Vault::trim_trailing_garbage() {
-  uint64_t vsize = vault_file_size();
+  // Reclaim the holes that reach EOF in the in-memory table first, so the commit
+  // below persists a table that never points past EOF; the file is shrunk last
+  // (a crash in between only leaves unreferenced trailing bytes).
+  const uint64_t shrink_to = reclaim_trailing_free();
+  const uint64_t vsize = vault_file_size();
   uint64_t end = VAULT_HEADER_SIZE;
   for (const auto& e : files_) {
     uint64_t eend = e.offset + NONCE_SIZE + 8 + e.size + TAG_SIZE;
@@ -695,15 +699,9 @@ void Vault::trim_trailing_garbage() {
     uint64_t rend = r.offset + r.size;
     if (rend > end) end = rend;
   }
-  bool changed = false;
-  if (end < vsize) {
-    truncate_vault(end);
-    changed = true;
-  }
-  size_t free_before = free_.size();
-  trim_trailing_free();
-  if (free_.size() != free_before) changed = true;
-  if (changed) commit_index();
+  if (end > vsize) end = vsize;
+  if (shrink_to != 0) commit_index();
+  if (end < vsize) truncate_vault(end);
 }
 
 void Vault::maybe_auto_reindex() {
@@ -768,10 +766,33 @@ void Vault::open(const std::filesystem::path& vault_path, const std::string& pas
     if (e.offset < VAULT_HEADER_SIZE || need > vsize)
       throw VaultError("CORRUPT", "索引与保险柜数据不一致");
   }
-  for (const auto& r : free_) {
-    if (r.size == 0 || r.offset < VAULT_HEADER_SIZE || r.offset > vsize ||
-        r.size > vsize - r.offset)
+  // Holes reaching past EOF are not corruption: an interrupted delete/reindex
+  // can leave them behind, and builds before the delete-order fix committed a
+  // hole and then shrank the file, so a vault emptied by that build carries one.
+  // Drop/clamp them here and persist the repaired table, so such a vault opens
+  // as the (smaller or empty) vault it really is instead of as "corrupt".
+  bool free_repaired = false;
+  for (size_t i = 0; i < free_.size();) {
+    FreeRange& r = free_[i];
+    if (r.size == 0 || r.offset < VAULT_HEADER_SIZE)
       throw VaultError("CORRUPT", "索引与保险柜数据不一致");
+    if (r.offset >= vsize) {  // wholly past EOF
+      free_.erase(free_.begin() + static_cast<std::ptrdiff_t>(i));
+      free_repaired = true;
+      continue;
+    }
+    if (r.size > vsize - r.offset) {  // reaches past EOF
+      r.size = vsize - r.offset;
+      free_repaired = true;
+    }
+    i++;
+  }
+  if (free_repaired) {
+    try {
+      commit_index();
+    } catch (const std::exception& e) {
+      std::fprintf(stderr, "[shinkuro] index repair failed: %s\n", e.what());
+    }
   }
 
   open_ = true;
@@ -983,13 +1004,16 @@ uint64_t Vault::remove(const std::string& name) {
   if (idx == files_.size()) throw VaultError("NOT_FOUND", "文件不存在: " + name);
 
   // O(1) lazy delete: mark the chunk as free instead of rewriting the whole
-  // vault. The index commit happens FIRST (atomic); the trailing truncation is
-  // an idempotent post-step, so a crash between the two is self-healed at open.
+  // vault. The index commit happens FIRST (atomic) and already carries the
+  // reclaimed tail, so the persisted table never describes bytes past EOF; the
+  // trailing truncation is an idempotent post-step, so a crash between the two
+  // is self-healed at open.
   uint64_t len = chunk_len(files_[idx].size);
   uint64_t off = files_[idx].offset;
   files_.erase(files_.begin() + static_cast<std::ptrdiff_t>(idx));
   index_.erase_file(name);
   add_free(off, len);
+  const uint64_t shrink_to = reclaim_trailing_free();
 
   try {
     commit_index();
@@ -1000,7 +1024,15 @@ uint64_t Vault::remove(const std::string& name) {
     }
     throw;
   }
-  trim_trailing_free();
+  if (shrink_to != 0 && shrink_to < vault_file_size()) {
+    try {
+      truncate_vault(shrink_to);
+    } catch (const std::exception& e) {
+      // The delete is already durable; leftover trailing bytes are trimmed at
+      // the next open().
+      std::fprintf(stderr, "[shinkuro] trim failed: %s\n", e.what());
+    }
+  }
   maybe_auto_reindex();
   return len;
 }
@@ -1065,8 +1097,14 @@ void Vault::consume_free(size_t idx, uint64_t need) {
   if (r.size == 0) free_.erase(free_.begin() + static_cast<std::ptrdiff_t>(idx));
 }
 
-void Vault::trim_trailing_free() {
+uint64_t Vault::reclaim_trailing_free() {
   uint64_t vsize = vault_file_size();
+  uint64_t live_end = VAULT_HEADER_SIZE;
+  for (const auto& e : files_) {
+    uint64_t eend = e.offset + NONCE_SIZE + 8 + e.size + TAG_SIZE;
+    if (eend > live_end) live_end = eend;
+  }
+  uint64_t target = 0;
   while (!free_.empty()) {
     const FreeRange& last = free_.back();
     if (last.offset + last.size < vsize) break;  // interior hole, keep it
@@ -1074,10 +1112,14 @@ void Vault::trim_trailing_free() {
       free_.pop_back();
       continue;
     }
-    truncate_vault(last.offset);  // reclaim trailing free space
+    // A hole overlapping live data can only come from a damaged index, and
+    // truncating there would destroy that file: keep the tail instead.
+    if (last.offset < live_end) break;
+    target = last.offset;
     vsize = last.offset;
     free_.pop_back();
   }
+  return target;
 }
 
 void Vault::truncate_vault(uint64_t size) {
