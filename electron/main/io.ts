@@ -1,8 +1,9 @@
 import { app } from "electron";
 import fs from "node:fs";
 import os from 'node:os';
+import * as path from 'path';
 
-export const RootDistPath: string = os.homedir() + "\\" + app.getName();
+export const RootDistPath: string = path.join(os.homedir(), app.getName());
 
 export function Exist(path: string): boolean{
   return fs.existsSync(path)

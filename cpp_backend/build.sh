@@ -1,15 +1,16 @@
 #!/usr/bin/env bash
 # ============================================================================
-#  Shinkuro vault backend build script (MinGW-w64 g++, C++17)
+#  Shinkuro vault backend build script (Linux, g++, C++17)
 #
 #  Requirements:
-#    - g++ in PATH (MinGW-w64)
-#    - OpenSSL (libcrypto) static library:
-#      pacman -S mingw-w64-x86_64-gcc mingw-w64-x86_64-openssl
+#    - g++ (with C++17 support)
+#    - OpenSSL dev headers + libcrypto
 #
-#  Usage:  bash build.sh [debug]   (safe to run from any directory)
+#      Debian/Ubuntu:  sudo apt install build-essential libssl-dev
+#      Arch:           sudo pacman -S base-devel openssl
+#      Fedora:         sudo dnf install gcc-c++ openssl-devel
 #
-#  Notes: built with -static, so the exe has NO runtime DLL dependencies.
+#  Usage:  bash build-linux.sh [debug]
 # ============================================================================
 set -e
 
@@ -20,11 +21,11 @@ SRC="src/main.cpp src/vault.cpp src/index.cpp src/crypto.cpp"
 OUT="build"
 mkdir -p "$OUT"
 
-FLAGS="-static -std=c++17 -O2 -Wall -Wextra -Isrc"
+FLAGS="-std=c++17 -O2 -Wall -Wextra -Isrc"
 if [ "$1" = "debug" ]; then
-  FLAGS="-static -std=c++17 -O0 -g -Wall -Wextra -Isrc"
+  FLAGS="-std=c++17 -O0 -g -Wall -Wextra -Isrc"
 fi
 
-echo "Compiling vault_backend.exe ..."
-g++ $FLAGS $SRC -o "$OUT/vault_backend.exe" -lcrypto -lws2_32 -lcrypt32
-echo "Built: $OUT/vault_backend.exe (static, no extra DLLs needed)"
+echo "Compiling vault_backend ..."
+g++ $FLAGS $SRC -o "$OUT/vault_backend" -lcrypto -lpthread
+echo "Built: $OUT/vault_backend"
