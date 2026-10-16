@@ -11,13 +11,6 @@
     "dist",
     "dist-electron"
   ],
-  // 打包前需先运行 npm run build:backend 编译出 vault_backend.exe（-static 静态编译，无 DLL 依赖）
-  "extraResources": [
-    {
-      "from": "cpp_backend/build/vault_backend.exe",
-      "to": "vault_backend/vault_backend.exe"
-    }
-  ],
   "mac": {
     "target": [
       "dmg"
@@ -34,7 +27,14 @@
         ]
       }
     ],
-    "artifactName": "${productName}-Windows-${version}-Setup.${ext}"
+    "artifactName": "${productName}-Windows-${version}-Setup.${ext}",
+    // Windows 平台专属：打包 .exe 后端
+    "extraResources": [
+      {
+        "from": "cpp_backend/build/vault_backend.exe",
+        "to": "vault_backend/vault_backend.exe"
+      }
+    ]
   },
   "nsis": {
     "oneClick": false,
@@ -47,6 +47,13 @@
     "target": [
       "AppImage"
     ],
-    "artifactName": "${productName}-Linux-${version}.${ext}"
+    "artifactName": "${productName}-Linux-${version}.${ext}",
+    // Linux 平台专属：打包无后缀的 Linux 可执行文件
+    "extraResources": [
+      {
+        "from": "cpp_backend/build/vault_backend",
+        "to": "vault_backend/vault_backend"
+      }
+    ]
   }
 }
